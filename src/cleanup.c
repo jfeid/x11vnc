@@ -163,6 +163,11 @@ void clean_up_exit(int ret) {
 	/* remove the shm areas: */
 	clean_shm(0);
 
+#if HAVE_NVFBC
+	/* cleanup NVFBC capture */
+	nvfbc_capture_cleanup();
+#endif
+
 	stop_stunnel();
 	if (use_openssl) {
 		ssl_helper_pid(0, 0);	/* killall */

@@ -211,6 +211,9 @@ extern char *xrandr_mode;
 extern char *pad_geometry;
 extern time_t pad_geometry_time;
 extern int use_snapfb;
+extern int use_nvfbc;
+extern int nvfbc_with_cursor;
+extern int nvfbc_with_diffmap;
 
 extern int use_xrecord;
 extern int noxrecord;

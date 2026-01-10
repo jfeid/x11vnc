@@ -81,6 +81,13 @@ extern void copy_image(XImage *dest, int x, int y, unsigned int w, unsigned int 
 extern void copy_raw_fb(XImage *dest, int x, int y, unsigned int w, unsigned int h);
 extern void init_track_keycode_state(void);
 
+#if HAVE_NVFBC
+/* NVFBC capture functions */
+extern int nvfbc_capture_init(void);
+extern void nvfbc_capture_cleanup(void);
+extern int nvfbc_capture_is_active(void);
+#endif
+
 extern void XTRAP_FakeKeyEvent_wr(Display* dpy, KeyCode key, Bool down,
     unsigned long delay);
 extern void XTestFakeKeyEvent_wr(Display* dpy, int dev_id, KeyCode key, Bool down,

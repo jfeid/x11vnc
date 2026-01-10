@@ -146,4 +146,14 @@ x11vnc_LDADD = \
 	@AVAHI_LIBS@ \
 	@XI2_LIBS@ \
 	@CAIRO_LIBS@ \
+	@NVFBC_LIBS@ \
 	$(LD_CYGIPC)
+
+# NVFBC (NVIDIA Frame Buffer Capture) support
+if HAVE_NVFBC
+x11vnc_SOURCES += \
+	nvfbc/nvfbc_capture.c \
+	nvfbc/nvfbc_capture.h \
+	nvfbc/NvFBC.h
+AM_CPPFLAGS += -I$(srcdir)/nvfbc
+endif

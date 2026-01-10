@@ -54,6 +54,198 @@ int keycode_state[256];
 int rootshift = 0;
 int clipshift = 0;
 
+#if HAVE_NVFBC
+/* NVFBC capture state */
+static int nvfbc_initialized = 0;
+static int nvfbc_capture_active = 0;
+static uint8_t *nvfbc_frame_buffer = NULL;
+static nvfbc_frame_info_t nvfbc_last_frame;
+
+/*
+ * Initialize NVFBC capture if enabled.
+ * Returns 1 on success, 0 on failure.
+ */
+int nvfbc_capture_init(void) {
+	nvfbc_cap_status_t status;
+	nvfbc_status_t nvfbc_status;
+	nvfbc_config_t config;
+
+	if (!use_nvfbc) {
+		return 0;
+	}
+
+	if (nvfbc_initialized) {
+		return 1;
+	}
+
+	rfbLog("NVFBC: Initializing NVIDIA Frame Buffer Capture...\n");
+
+	status = nvfbc_init();
+	if (status != NVFBC_CAP_OK) {
+		rfbLog("NVFBC: Initialization failed: %s\n", nvfbc_status_string(status));
+		rfbLog("NVFBC: %s\n", nvfbc_get_last_error());
+		use_nvfbc = 0;
+		return 0;
+	}
+
+	/* Get display status */
+	status = nvfbc_get_status(&nvfbc_status);
+	if (status != NVFBC_CAP_OK) {
+		rfbLog("NVFBC: Failed to get status: %s\n", nvfbc_status_string(status));
+		nvfbc_cleanup();
+		use_nvfbc = 0;
+		return 0;
+	}
+
+	if (!nvfbc_status.is_capture_possible) {
+		rfbLog("NVFBC: Capture not possible on this display\n");
+		nvfbc_cleanup();
+		use_nvfbc = 0;
+		return 0;
+	}
+
+	rfbLog("NVFBC: Screen size: %ux%u\n", nvfbc_status.screen_width, nvfbc_status.screen_height);
+	rfbLog("NVFBC: Outputs: %u\n", nvfbc_status.num_outputs);
+
+	/* Configure capture */
+	memset(&config, 0, sizeof(config));
+	config.with_cursor = nvfbc_with_cursor;
+	config.with_diff_map = nvfbc_with_diffmap;
+	config.diff_map_scale = 16;
+	config.sampling_rate_ms = 16;  /* ~60 Hz */
+	config.track_output = -1;  /* Entire screen */
+	config.push_model = 0;
+
+	/* Start capture */
+	status = nvfbc_start_capture(&config);
+	if (status != NVFBC_CAP_OK) {
+		rfbLog("NVFBC: Failed to start capture: %s\n", nvfbc_status_string(status));
+		rfbLog("NVFBC: %s\n", nvfbc_get_last_error());
+		nvfbc_cleanup();
+		use_nvfbc = 0;
+		return 0;
+	}
+
+	nvfbc_initialized = 1;
+	nvfbc_capture_active = 1;
+	rfbLog("NVFBC: Capture initialized successfully (cursor=%d, diffmap=%d)\n",
+	       nvfbc_with_cursor, nvfbc_with_diffmap);
+	return 1;
+}
+
+/*
+ * Cleanup NVFBC capture.
+ */
+void nvfbc_capture_cleanup(void) {
+	if (nvfbc_initialized) {
+		rfbLog("NVFBC: Cleaning up...\n");
+		nvfbc_stop_capture();
+		nvfbc_cleanup();
+		nvfbc_initialized = 0;
+		nvfbc_capture_active = 0;
+		nvfbc_frame_buffer = NULL;
+	}
+}
+
+/*
+ * Check if NVFBC capture is active.
+ */
+int nvfbc_capture_is_active(void) {
+	return nvfbc_capture_active;
+}
+
+/*
+ * Capture a frame using NVFBC into the destination XImage.
+ * The XImage should be in BGRA format for best performance.
+ * Returns 1 on success, 0 on failure.
+ */
+static int nvfbc_copy_to_ximage(XImage *dest, int x, int y, unsigned int w, unsigned int h) {
+	nvfbc_cap_status_t status;
+	uint8_t *src_row, *dst_row;
+	unsigned int line;
+	int src_stride, dst_stride;
+	int pixelsize;
+
+	if (!nvfbc_capture_active) {
+		return 0;
+	}
+
+	/* Grab frame with short timeout */
+	status = nvfbc_grab_frame(&nvfbc_frame_buffer, &nvfbc_last_frame, 100);
+	if (status == NVFBC_CAP_ERR_RECREATE) {
+		/* Display mode changed, need to reinitialize */
+		rfbLog("NVFBC: Display mode changed, reinitializing...\n");
+		nvfbc_stop_capture();
+		nvfbc_capture_active = 0;
+
+		/* Try to restart capture */
+		nvfbc_config_t config;
+		memset(&config, 0, sizeof(config));
+		config.with_cursor = nvfbc_with_cursor;
+		config.with_diff_map = nvfbc_with_diffmap;
+		config.diff_map_scale = 16;
+		config.sampling_rate_ms = 16;
+		config.track_output = -1;
+		config.push_model = 0;
+
+		status = nvfbc_start_capture(&config);
+		if (status != NVFBC_CAP_OK) {
+			rfbLog("NVFBC: Failed to restart capture: %s\n", nvfbc_status_string(status));
+			return 0;
+		}
+		nvfbc_capture_active = 1;
+
+		/* Try again */
+		status = nvfbc_grab_frame(&nvfbc_frame_buffer, &nvfbc_last_frame, 100);
+	}
+
+	if (status != NVFBC_CAP_OK) {
+		rfbLog("NVFBC: Frame grab failed: %s\n", nvfbc_status_string(status));
+		return 0;
+	}
+
+	if (!nvfbc_frame_buffer) {
+		return 0;
+	}
+
+	/* Copy frame data to XImage */
+	/* NVFBC outputs BGRA, x11vnc typically uses BGRA too on modern systems */
+	pixelsize = dest->bits_per_pixel / 8;
+	src_stride = nvfbc_last_frame.width * 4;  /* NVFBC is always 32bpp BGRA */
+	dst_stride = dest->bytes_per_line;
+
+	/* Clamp dimensions */
+	if (x + w > nvfbc_last_frame.width) {
+		w = nvfbc_last_frame.width - x;
+	}
+	if (y + h > nvfbc_last_frame.height) {
+		h = nvfbc_last_frame.height - y;
+	}
+
+	for (line = 0; line < h; line++) {
+		src_row = nvfbc_frame_buffer + (y + line) * src_stride + x * 4;
+		dst_row = (uint8_t *)dest->data + line * dst_stride;
+
+		if (pixelsize == 4) {
+			/* Direct copy for 32bpp */
+			memcpy(dst_row, src_row, (size_t)w * 4);
+		} else if (pixelsize == 3) {
+			/* Convert BGRA to BGR for 24bpp */
+			unsigned int px;
+			for (px = 0; px < w; px++) {
+				dst_row[px * 3 + 0] = src_row[px * 4 + 0];  /* B */
+				dst_row[px * 3 + 1] = src_row[px * 4 + 1];  /* G */
+				dst_row[px * 3 + 2] = src_row[px * 4 + 2];  /* R */
+			}
+		} else {
+			/* Unsupported depth, fall back */
+			return 0;
+		}
+	}
+
+	return 1;
+}
+#endif /* HAVE_NVFBC */
 
 int guess_bits_per_color(int bits_per_pixel);
 
@@ -840,6 +1032,16 @@ void copy_image(XImage *dest, int x, int y, unsigned int w, unsigned int h) {
 	if (h < 1)  {
 		h = dest->height;
 	}
+
+#if HAVE_NVFBC
+	/* Try NVFBC capture first if enabled */
+	if (use_nvfbc && nvfbc_capture_active) {
+		if (nvfbc_copy_to_ximage(dest, x, y, w, h)) {
+			return;  /* Success */
+		}
+		/* Fall through to other methods on failure */
+	}
+#endif
 
 	if (raw_fb) {
 		copy_raw_fb(dest, x, y, w, h);

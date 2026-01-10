@@ -3897,6 +3897,32 @@ int main(int argc, char* argv[]) {
 			use_snapfb = 1;
 			continue;
 		}
+#if HAVE_NVFBC
+		if (!strcmp(arg, "-nvfbc")) {
+			use_nvfbc = 1;
+			continue;
+		}
+		if (!strcmp(arg, "-nonvfbc")) {
+			use_nvfbc = 0;
+			continue;
+		}
+		if (!strcmp(arg, "-nvfbc_cursor")) {
+			nvfbc_with_cursor = 1;
+			continue;
+		}
+		if (!strcmp(arg, "-nvfbc_nocursor")) {
+			nvfbc_with_cursor = 0;
+			continue;
+		}
+		if (!strcmp(arg, "-nvfbc_diffmap")) {
+			nvfbc_with_diffmap = 1;
+			continue;
+		}
+		if (!strcmp(arg, "-nvfbc_nodiffmap")) {
+			nvfbc_with_diffmap = 0;
+			continue;
+		}
+#endif
 		if (!strcmp(arg, "-rand")) {
 			/* equiv. to -nopw -rawfb rand for quick tests */
 			raw_fb_str = strdup("rand");
@@ -5747,6 +5773,13 @@ int main(int argc, char* argv[]) {
 	 * n.b. we do not have to X_LOCK any X11 calls until watch_loop()
 	 * is called since we are single-threaded until then.
 	 */
+
+#if HAVE_NVFBC
+	/* Initialize NVFBC capture if requested */
+	if (use_nvfbc) {
+		nvfbc_capture_init();
+	}
+#endif
 
 	initialize_screen(&argc_vnc, argv_vnc, fb0);
 

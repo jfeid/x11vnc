@@ -246,6 +246,9 @@ char *xrandr_mode = NULL;
 char *pad_geometry = NULL;
 time_t pad_geometry_time = 0;
 int use_snapfb = 0;
+int use_nvfbc = 0;
+int nvfbc_with_cursor = 1;
+int nvfbc_with_diffmap = 1;
 
 int use_xrecord = 0;
 int noxrecord = 0;

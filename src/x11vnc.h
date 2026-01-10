@@ -77,6 +77,11 @@ so, delete this exception statement from your version.
 
 #endif
 
+#if HAVE_NVFBC
+/* NVIDIA Frame Buffer Capture */
+#include "nvfbc_capture.h"
+#endif
+
 /* we can now build under --without-x: */
 #if HAVE_X11
 

@@ -81,6 +81,21 @@ if test "x$with_drm" != "xno"; then
 fi
 AC_SUBST(DRM_LIBS)
 
+# NVFBC (NVIDIA Frame Buffer Capture) support
+AH_TEMPLATE(HAVE_NVFBC, [NVIDIA NVFBC capture library support])
+AC_ARG_WITH(nvfbc,
+[  --without-nvfbc         disable support for NVIDIA NVFBC capture]
+[  --with-nvfbc            enable NVFBC capture (auto-detected at runtime)],,)
+if test "x$with_nvfbc" != "xno"; then
+	# NVFBC is loaded dynamically at runtime via dlopen, so we only need dl
+	AC_CHECK_LIB(dl, dlopen,
+		NVFBC_LIBS="-ldl"
+		[AC_DEFINE(HAVE_NVFBC) HAVE_NVFBC="true"],
+		[AC_MSG_WARN([dlopen not found, NVFBC support disabled])])
+fi
+AC_SUBST(NVFBC_LIBS)
+AM_CONDITIONAL(HAVE_NVFBC, test "$HAVE_NVFBC" = "true")
+
 AH_TEMPLATE(HAVE_X509_PRINT_EX_FP, [open ssl X509_print_ex_fp available])
 if test "x$with_ssl" != "xno"; then
 	if test "x$HAVE_LIBCRYPTO" = "xtrue"; then

@@ -55,11 +55,19 @@ int rootshift = 0;
 int clipshift = 0;
 
 #if HAVE_NVFBC
+#include <sys/time.h>
+
 /* NVFBC capture state */
 static int nvfbc_initialized = 0;
 static int nvfbc_capture_active = 0;
 static uint8_t *nvfbc_frame_buffer = NULL;
 static nvfbc_frame_info_t nvfbc_last_frame;
+
+/* NVFBC performance tracking */
+static unsigned long nvfbc_frame_count = 0;
+static unsigned long nvfbc_new_frame_count = 0;
+static struct timeval nvfbc_stats_start;
+static int nvfbc_stats_initialized = 0;
 
 /*
  * Initialize NVFBC capture if enabled.
@@ -170,8 +178,8 @@ static int nvfbc_copy_to_ximage(XImage *dest, int x, int y, unsigned int w, unsi
 		return 0;
 	}
 
-	/* Grab frame with short timeout */
-	status = nvfbc_grab_frame(&nvfbc_frame_buffer, &nvfbc_last_frame, 100);
+	/* Grab frame in non-blocking mode to avoid stalling input */
+	status = nvfbc_grab_frame(&nvfbc_frame_buffer, &nvfbc_last_frame, 0);
 	if (status == NVFBC_CAP_ERR_RECREATE) {
 		/* Display mode changed, need to reinitialize */
 		rfbLog("NVFBC: Display mode changed, reinitializing...\n");
@@ -196,7 +204,7 @@ static int nvfbc_copy_to_ximage(XImage *dest, int x, int y, unsigned int w, unsi
 		nvfbc_capture_active = 1;
 
 		/* Try again */
-		status = nvfbc_grab_frame(&nvfbc_frame_buffer, &nvfbc_last_frame, 100);
+		status = nvfbc_grab_frame(&nvfbc_frame_buffer, &nvfbc_last_frame, 0);
 	}
 
 	if (status != NVFBC_CAP_OK) {
@@ -206,6 +214,37 @@ static int nvfbc_copy_to_ximage(XImage *dest, int x, int y, unsigned int w, unsi
 
 	if (!nvfbc_frame_buffer) {
 		return 0;
+	}
+
+	/* Performance tracking */
+	{
+		struct timeval now;
+		gettimeofday(&now, NULL);
+
+		if (!nvfbc_stats_initialized) {
+			nvfbc_stats_start = now;
+			nvfbc_stats_initialized = 1;
+			nvfbc_frame_count = 0;
+			nvfbc_new_frame_count = 0;
+		}
+
+		nvfbc_frame_count++;
+		if (nvfbc_last_frame.is_new_frame) {
+			nvfbc_new_frame_count++;
+		}
+
+		/* Log stats every 10 seconds */
+		double elapsed = (now.tv_sec - nvfbc_stats_start.tv_sec) +
+		                 (now.tv_usec - nvfbc_stats_start.tv_usec) / 1000000.0;
+		if (elapsed >= 10.0) {
+			double fps = nvfbc_new_frame_count / elapsed;
+			double grabs_per_sec = nvfbc_frame_count / elapsed;
+			rfbLog("NVFBC stats: %.1f new fps, %.0f grabs/sec, %lu new frames / %lu total grabs\n",
+			       fps, grabs_per_sec, nvfbc_new_frame_count, nvfbc_frame_count);
+			nvfbc_stats_start = now;
+			nvfbc_frame_count = 0;
+			nvfbc_new_frame_count = 0;
+		}
 	}
 
 	/* Copy frame data to XImage */

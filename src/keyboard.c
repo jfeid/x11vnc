@@ -2034,6 +2034,8 @@ static void xkb_tweak_keyboard(rfbBool down, rfbKeySym keysym,
 		unsigned int ms;
 		KeySym ks;
 		Bool dn;
+		unsigned int lock_affect = 0, lock_values = 0;
+		unsigned int lock_restore_affect = 0, lock_restore_values = 0;
 
 		/* remember these to aid the subsequent up case: */
 		for (i=KLAST-1; i >= 1; i--) {
@@ -2103,6 +2105,42 @@ static void xkb_tweak_keyboard(rfbBool down, rfbKeySym keysym,
 			}
 
 			b = b << 1;
+		}
+
+		/*
+		 * Handle lock-type modifier bits (Caps Lock, Num Lock, etc.)
+		 * via XkbLockModifiers instead of simulating key press/release.
+		 * Lock keys are toggles, so the press+release approach used for
+		 * regular modifiers (Shift, Alt) corrupts the lock state on undo.
+		 */
+		b = 0x1;
+		for (i = 0; i < 8; i++) {
+			if (needmods[i] >= 0 && (b & kbstate.locked_mods)) {
+				/*
+				 * This modifier bit is currently locked and
+				 * needs to change. Use XkbLockModifiers to
+				 * directly set/clear it instead of simulating
+				 * key press/release which would toggle and
+				 * corrupt the lock state.
+				 */
+				lock_affect |= b;
+				if (needmods[i]) {
+					lock_values |= b; /* need it down */
+				}
+				/* remember original state for restore */
+				lock_restore_affect |= b;
+				lock_restore_values |= (b & kbstate.locked_mods);
+				/* mark as handled so key simulation skips it */
+				needmods[i] = -4;
+			}
+			b <<= 1;
+		}
+
+		if (lock_affect) {
+			if (use_multipointer)
+				XkbLockModifiers(dpy, cd->kbd_id, lock_affect, lock_values);
+			else
+				XkbLockModifiers(dpy, XkbUseCoreKbd, lock_affect, lock_values);
 		}
 
 		/*
@@ -2352,6 +2390,17 @@ static void xkb_tweak_keyboard(rfbBool down, rfbKeySym keysym,
 			if (dn) continue;
 			XTestFakeKeyEvent_wr(dpy, cd->kbd_id, sentmods[i], !dn,
 			    CurrentTime);
+		}
+
+		/*
+		 * Restore lock modifier state that was changed via
+		 * XkbLockModifiers above.
+		 */
+		if (lock_restore_affect) {
+			if (use_multipointer)
+				XkbLockModifiers(dpy, cd->kbd_id, lock_restore_affect, lock_restore_values);
+			else
+				XkbLockModifiers(dpy, XkbUseCoreKbd, lock_restore_affect, lock_restore_values);
 		}
 
 	} else { /* for up case, hopefully just need to pop it up: */

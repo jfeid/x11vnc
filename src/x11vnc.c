@@ -5777,7 +5777,19 @@ int main(int argc, char* argv[]) {
 #if HAVE_NVFBC
 	/* Initialize NVFBC capture if requested */
 	if (use_nvfbc) {
-		nvfbc_capture_init();
+		if (nvfbc_capture_init() && using_shm) {
+			/*
+			 * All framebuffer reads go through NVFBC, so the
+			 * MIT-SHM polling images are never used.  Creating
+			 * them also fails with X_ShmAttach BadAccess when
+			 * the X server runs as a different user than us
+			 * (e.g. rootless Xorg), since the segments are
+			 * created with owner-only permissions.
+			 */
+			rfbLog("NVFBC: disabling MIT-SHM polling images "
+			    "(not used with NVFBC capture).\n");
+			using_shm = 0;
+		}
 	}
 #endif
 

@@ -68,6 +68,17 @@ typedef struct {
     int track_output;           /* Output ID to track, or -1 for entire screen */
     uint32_t sampling_rate_ms;  /* Capture rate in ms (default: 16 = ~60Hz) */
     int push_model;             /* 1 for push model (capture on damage) */
+    int allow_direct_capture;   /* 1 to let NVFBC bypass X for fullscreen apps.
+                                 * Requires push_model and !with_cursor. */
+
+    /*
+     * Optional crop of the tracked screen, used when track_output < 0.
+     * Only honoured when box_w and box_h are both non-zero.
+     *
+     * NOTE: the driver silently ignores captureBox unless frameSize is set
+     * as well, so both are always programmed together.
+     */
+    uint32_t box_x, box_y, box_w, box_h;
 } nvfbc_config_t;
 
 /*
@@ -93,6 +104,23 @@ int nvfbc_is_available(void);
  * Returns: NVFBC_CAP_OK on success, error code otherwise.
  */
 nvfbc_cap_status_t nvfbc_get_status(nvfbc_status_t *status);
+
+/*
+ * Find a connected output whose tracked box exactly matches the given region.
+ *
+ * Tracking a single output is cheaper than tracking the whole X screen and
+ * cropping it, so this is preferred when the region x11vnc serves happens to
+ * be exactly one monitor.
+ *
+ * status:   Filled in by nvfbc_get_status().
+ * out_id:   Receives the matching output ID.
+ * out_name: Receives a pointer to the output name (owned by status).
+ *
+ * Returns: 1 on match, 0 otherwise.
+ */
+int nvfbc_find_output_by_box(const nvfbc_status_t *status,
+                             uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                             uint32_t *out_id, const char **out_name);
 
 /*
  * Start a capture session with the given configuration.

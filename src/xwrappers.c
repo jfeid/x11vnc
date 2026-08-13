@@ -63,11 +63,57 @@ static int nvfbc_capture_active = 0;
 static uint8_t *nvfbc_frame_buffer = NULL;
 static nvfbc_frame_info_t nvfbc_last_frame;
 
+/*
+ * Offset from x11vnc's served coordinate space into the captured frame.
+ *
+ * copy_image() callers work in clipped coordinates; the X paths translate via
+ * ADJUST_ROOTSHIFT.  When the capture is cropped to exactly the served region
+ * these are zero, but they must still be honoured when NVFBC hands back a
+ * larger frame than we serve.
+ */
+static int nvfbc_src_dx = 0, nvfbc_src_dy = 0;
+
+/*
+ * One grab per scan cycle.
+ *
+ * copy_image() is x11vnc's per-scanline and per-tile read primitive, so
+ * grabbing inside it issued a fresh full-frame capture hundreds of times per
+ * displayed frame.  Worse, the NVFBC buffer is a single buffer the driver
+ * overwrites on the next grab, so a scan could assemble main_fb out of
+ * several different frames and tear.
+ *
+ * scan_for_updates() now bumps the epoch once per cycle and grabs eagerly
+ * (outside X_LOCK); every read in that cycle is served from that one frame.
+ */
+static unsigned long nvfbc_epoch = 0;
+static unsigned long nvfbc_grabbed_epoch = ~0UL;
+static int nvfbc_frame_ok = 0;
+static int nvfbc_in_scan_cycle = 0;
+
+/* Chosen once at init; reused verbatim when a modeset forces a restart. */
+static nvfbc_config_t nvfbc_cfg;
+
 /* NVFBC performance tracking */
 static unsigned long nvfbc_frame_count = 0;
 static unsigned long nvfbc_new_frame_count = 0;
 static struct timeval nvfbc_stats_start;
 static int nvfbc_stats_initialized = 0;
+
+/*
+ * Start (or restart) capture from nvfbc_cfg.  Returns 1 on success.
+ * Keeping this in one place stops the modeset-recovery path from drifting
+ * away from the configuration chosen at init.
+ */
+static int nvfbc_start_configured_capture(void) {
+	nvfbc_cap_status_t status = nvfbc_start_capture(&nvfbc_cfg);
+
+	if (status != NVFBC_CAP_OK) {
+		rfbLog("NVFBC: Failed to start capture: %s\n", nvfbc_status_string(status));
+		rfbLog("NVFBC: %s\n", nvfbc_get_last_error());
+		return 0;
+	}
+	return 1;
+}
 
 /*
  * Initialize NVFBC capture if enabled.
@@ -77,6 +123,9 @@ int nvfbc_capture_init(void) {
 	nvfbc_cap_status_t status;
 	nvfbc_status_t nvfbc_status;
 	nvfbc_config_t config;
+	int reg_x, reg_y, reg_w, reg_h, cap_x, cap_y;
+	uint32_t out_id = 0;
+	const char *out_name = NULL;
 
 	if (!use_nvfbc) {
 		return 0;
@@ -84,6 +133,19 @@ int nvfbc_capture_init(void) {
 
 	if (nvfbc_initialized) {
 		return 1;
+	}
+
+	/*
+	 * NVFBC can only hand back screen or per-output contents.  With -id/-sid
+	 * and no -rootshift the X paths read the window drawable directly, which
+	 * NVFBC cannot reproduce, so capture would silently show the wrong
+	 * pixels.  Refuse rather than serve garbage.
+	 */
+	if (subwin && !rootshift) {
+		rfbLog("NVFBC: -id/-sid without -rootshift captures a window, which "
+		    "NVFBC cannot do; disabling NVFBC.\n");
+		use_nvfbc = 0;
+		return 0;
 	}
 
 	rfbLog("NVFBC: Initializing NVIDIA Frame Buffer Capture...\n");
@@ -115,20 +177,69 @@ int nvfbc_capture_init(void) {
 	rfbLog("NVFBC: Screen size: %ux%u\n", nvfbc_status.screen_width, nvfbc_status.screen_height);
 	rfbLog("NVFBC: Outputs: %u\n", nvfbc_status.num_outputs);
 
+	/*
+	 * Work out the region x11vnc actually serves, in root coordinates.
+	 * This mirrors what ADJUST_ROOTSHIFT does for the X read paths.
+	 */
+	reg_x = clipshift ? coff_x : 0;
+	reg_y = clipshift ? coff_y : 0;
+	reg_w = dpy_x;
+	reg_h = dpy_y;
+	if (subwin && rootshift) {
+		reg_x += off_x;
+		reg_y += off_y;
+	}
+
 	/* Configure capture */
 	memset(&config, 0, sizeof(config));
 	config.with_cursor = nvfbc_with_cursor;
 	config.with_diff_map = nvfbc_with_diffmap;
-	config.diff_map_scale = 16;
-	config.sampling_rate_ms = 16;  /* ~60 Hz */
-	config.track_output = -1;  /* Entire screen */
-	config.push_model = 0;
+	/*
+	 * One diffmap cell per x11vnc tile, so the map can drive tile_has_diff[]
+	 * directly.  Both grids are ceil(size/32), so they line up exactly.
+	 */
+	config.diff_map_scale = tile_x;
+	config.sampling_rate_ms = 16;  /* ~60 Hz; ignored when push_model is on */
+	config.track_output = -1;
+	config.push_model = nvfbc_push_model;
+	config.allow_direct_capture = nvfbc_direct_capture;
 
-	/* Start capture */
-	status = nvfbc_start_capture(&config);
-	if (status != NVFBC_CAP_OK) {
-		rfbLog("NVFBC: Failed to start capture: %s\n", nvfbc_status_string(status));
-		rfbLog("NVFBC: %s\n", nvfbc_get_last_error());
+	/*
+	 * Capture only what we serve.  Tracking a single output is cheapest, so
+	 * prefer it when the served region is exactly one monitor; otherwise
+	 * crop the screen.  Either way the captured frame's origin lines up with
+	 * our coordinate space, which is also what makes -clip correct here.
+	 */
+	if (nvfbc_find_output_by_box(&nvfbc_status, (uint32_t)reg_x, (uint32_t)reg_y,
+	    (uint32_t)reg_w, (uint32_t)reg_h, &out_id, &out_name)) {
+		config.track_output = (int)out_id;
+		cap_x = reg_x;
+		cap_y = reg_y;
+		rfbLog("NVFBC: tracking output %u (%s) %dx%d+%d+%d\n",
+		    out_id, out_name ? out_name : "?", reg_w, reg_h, reg_x, reg_y);
+	} else if (reg_w < (int)nvfbc_status.screen_width ||
+	           reg_h < (int)nvfbc_status.screen_height) {
+		config.box_x = (uint32_t)reg_x;
+		config.box_y = (uint32_t)reg_y;
+		config.box_w = (uint32_t)reg_w;
+		config.box_h = (uint32_t)reg_h;
+		cap_x = reg_x;
+		cap_y = reg_y;
+		rfbLog("NVFBC: cropping screen to %dx%d+%d+%d\n",
+		    reg_w, reg_h, reg_x, reg_y);
+	} else {
+		cap_x = 0;
+		cap_y = 0;
+		rfbLog("NVFBC: capturing full screen %ux%u\n",
+		    nvfbc_status.screen_width, nvfbc_status.screen_height);
+	}
+
+	nvfbc_src_dx = reg_x - cap_x;
+	nvfbc_src_dy = reg_y - cap_y;
+
+	memcpy(&nvfbc_cfg, &config, sizeof(nvfbc_cfg));
+
+	if (!nvfbc_start_configured_capture()) {
 		nvfbc_cleanup();
 		use_nvfbc = 0;
 		return 0;
@@ -167,43 +278,34 @@ int nvfbc_capture_is_active(void) {
  * The XImage should be in BGRA format for best performance.
  * Returns 1 on success, 0 on failure.
  */
-static int nvfbc_copy_to_ximage(XImage *dest, int x, int y, unsigned int w, unsigned int h) {
+static int nvfbc_grab_current(void) {
 	nvfbc_cap_status_t status;
-	uint8_t *src_row, *dst_row;
-	unsigned int line;
-	int src_stride, dst_stride;
-	int pixelsize;
+	struct timeval now;
+	double elapsed;
 
 	if (!nvfbc_capture_active) {
 		return 0;
 	}
 
-	/* Grab frame in non-blocking mode to avoid stalling input */
+	/* Already have this cycle's frame: reuse it, no driver call. */
+	if (nvfbc_grabbed_epoch == nvfbc_epoch) {
+		return nvfbc_frame_ok;
+	}
+	nvfbc_grabbed_epoch = nvfbc_epoch;
+	nvfbc_frame_ok = 0;
+
+	/* Non-blocking: a blocking grab here would stall the scan and, with it,
+	 * anything waiting on X_LOCK. */
 	status = nvfbc_grab_frame(&nvfbc_frame_buffer, &nvfbc_last_frame, 0);
 	if (status == NVFBC_CAP_ERR_RECREATE) {
-		/* Display mode changed, need to reinitialize */
 		rfbLog("NVFBC: Display mode changed, reinitializing...\n");
 		nvfbc_stop_capture();
 		nvfbc_capture_active = 0;
 
-		/* Try to restart capture */
-		nvfbc_config_t config;
-		memset(&config, 0, sizeof(config));
-		config.with_cursor = nvfbc_with_cursor;
-		config.with_diff_map = nvfbc_with_diffmap;
-		config.diff_map_scale = 16;
-		config.sampling_rate_ms = 16;
-		config.track_output = -1;
-		config.push_model = 0;
-
-		status = nvfbc_start_capture(&config);
-		if (status != NVFBC_CAP_OK) {
-			rfbLog("NVFBC: Failed to restart capture: %s\n", nvfbc_status_string(status));
+		if (!nvfbc_start_configured_capture()) {
 			return 0;
 		}
 		nvfbc_capture_active = 1;
-
-		/* Try again */
 		status = nvfbc_grab_frame(&nvfbc_frame_buffer, &nvfbc_last_frame, 0);
 	}
 
@@ -211,64 +313,173 @@ static int nvfbc_copy_to_ximage(XImage *dest, int x, int y, unsigned int w, unsi
 		rfbLog("NVFBC: Frame grab failed: %s\n", nvfbc_status_string(status));
 		return 0;
 	}
-
 	if (!nvfbc_frame_buffer) {
 		return 0;
 	}
 
-	/* Performance tracking */
-	{
-		struct timeval now;
-		gettimeofday(&now, NULL);
-
-		if (!nvfbc_stats_initialized) {
-			nvfbc_stats_start = now;
-			nvfbc_stats_initialized = 1;
-			nvfbc_frame_count = 0;
-			nvfbc_new_frame_count = 0;
-		}
-
-		nvfbc_frame_count++;
-		if (nvfbc_last_frame.is_new_frame) {
-			nvfbc_new_frame_count++;
-		}
-
-		/* Log stats every 10 seconds */
-		double elapsed = (now.tv_sec - nvfbc_stats_start.tv_sec) +
-		                 (now.tv_usec - nvfbc_stats_start.tv_usec) / 1000000.0;
-		if (elapsed >= 10.0) {
-			double fps = nvfbc_new_frame_count / elapsed;
-			double grabs_per_sec = nvfbc_frame_count / elapsed;
-			rfbLog("NVFBC stats: %.1f new fps, %.0f grabs/sec, %lu new frames / %lu total grabs\n",
-			       fps, grabs_per_sec, nvfbc_new_frame_count, nvfbc_frame_count);
-			nvfbc_stats_start = now;
-			nvfbc_frame_count = 0;
-			nvfbc_new_frame_count = 0;
-		}
+	/* Performance tracking.  One grab per cycle now, so this is per-cycle
+	 * rather than per-scanline; the log format is unchanged so existing
+	 * tooling keeps parsing it. */
+	gettimeofday(&now, NULL);
+	if (!nvfbc_stats_initialized) {
+		nvfbc_stats_start = now;
+		nvfbc_stats_initialized = 1;
+		nvfbc_frame_count = 0;
+		nvfbc_new_frame_count = 0;
+	}
+	nvfbc_frame_count++;
+	if (nvfbc_last_frame.is_new_frame) {
+		nvfbc_new_frame_count++;
+	}
+	elapsed = (now.tv_sec - nvfbc_stats_start.tv_sec) +
+	          (now.tv_usec - nvfbc_stats_start.tv_usec) / 1000000.0;
+	if (elapsed >= 10.0) {
+		rfbLog("NVFBC stats: %.1f new fps, %.0f grabs/sec, %lu new frames / %lu total grabs\n",
+		       nvfbc_new_frame_count / elapsed, nvfbc_frame_count / elapsed,
+		       nvfbc_new_frame_count, nvfbc_frame_count);
+		nvfbc_stats_start = now;
+		nvfbc_frame_count = 0;
+		nvfbc_new_frame_count = 0;
 	}
 
-	/* Copy frame data to XImage */
-	/* NVFBC outputs BGRA, x11vnc typically uses BGRA too on modern systems */
+	nvfbc_frame_ok = 1;
+	return 1;
+}
+
+/*
+ * Begin a capture cycle: take one coherent frame for the whole scan.
+ *
+ * Called from scan_for_updates() before it takes X_LOCK.  The grab itself
+ * touches no X state, and a new-frame grab costs milliseconds, so doing it
+ * under X_LOCK stalled XTest input for the duration.
+ */
+void nvfbc_begin_frame(void) {
+	if (!use_nvfbc || !nvfbc_capture_active) {
+		return;
+	}
+	NVFBC_LOCK;
+	nvfbc_epoch++;
+	nvfbc_grab_current();
+	NVFBC_UNLOCK;
+}
+
+/*
+ * Force the next read to re-grab rather than reuse this cycle's frame.
+ *
+ * Only for callers that run outside a scan cycle and genuinely need "now";
+ * calling it inside a cycle throws away the frame the cycle was built on and
+ * buys a redundant full-frame DMA.
+ */
+void nvfbc_invalidate_frame(void) {
+	NVFBC_LOCK;
+	nvfbc_grabbed_epoch = ~0UL;
+	NVFBC_UNLOCK;
+}
+
+/* Set around the whole-screen copy that happens inside a scan cycle. */
+void nvfbc_set_in_scan_cycle(int v) {
+	nvfbc_in_scan_cycle = v;
+}
+
+/*
+ * Freshness rule for copy_screen(), which is reached from both sides:
+ *
+ *  - inside a scan cycle (the fs_frac whole-screen path) the cycle's frame is
+ *    exactly what the diff map was computed against, and re-grabbing costs a
+ *    redundant full-frame DMA (~3ms, measured as a 12% frame-rate hit);
+ *  - outside one (client connect, resize, startup) there may be no next cycle
+ *    soon - a napping server can sit idle for a long time - so a stale frame
+ *    would stay on screen.  Grab.
+ */
+void nvfbc_invalidate_if_out_of_cycle(void) {
+	if (!nvfbc_in_scan_cycle) {
+		nvfbc_invalidate_frame();
+	}
+}
+
+/*
+ * Did this cycle's grab yield a frame the display had not produced before?
+ * If not, no pixel can have changed and the whole scan can be skipped.
+ * Returns -1 when the answer is not known (no usable frame).
+ */
+int nvfbc_frame_is_new(void) {
+	int ret;
+
+	NVFBC_LOCK;
+	if (!use_nvfbc || !nvfbc_capture_active || !nvfbc_frame_ok) {
+		ret = -1;
+	} else {
+		ret = nvfbc_last_frame.is_new_frame ? 1 : 0;
+	}
+	NVFBC_UNLOCK;
+	return ret;
+}
+
+/*
+ * Capture a frame using NVFBC into the destination XImage.
+ * The XImage should be in BGRA format for best performance.
+ * Returns 1 on success, 0 on failure.
+ */
+static int nvfbc_copy_to_ximage(XImage *dest, int x, int y, unsigned int w, unsigned int h) {
+	uint8_t *src_row, *dst_row;
+	unsigned int line;
+	int src_stride, dst_stride;
+	int pixelsize;
+	int sx, sy;
+	int avail_w, avail_h;
+	int ok;
+
+	NVFBC_LOCK;
+	ok = nvfbc_grab_current();
+	if (!ok) {
+		NVFBC_UNLOCK;
+		return 0;
+	}
+
 	pixelsize = dest->bits_per_pixel / 8;
-	src_stride = nvfbc_last_frame.width * 4;  /* NVFBC is always 32bpp BGRA */
+	if (pixelsize != 4 && pixelsize != 3) {
+		NVFBC_UNLOCK;
+		return 0;	/* unsupported depth: let the X paths handle it */
+	}
+
+	src_stride = (int)nvfbc_last_frame.width * 4;	/* NVFBC frame is BGRA */
 	dst_stride = dest->bytes_per_line;
 
-	/* Clamp dimensions */
-	if (x + w > nvfbc_last_frame.width) {
-		w = nvfbc_last_frame.width - x;
+	/* Translate from x11vnc's served coordinates into the captured frame. */
+	sx = x + nvfbc_src_dx;
+	sy = y + nvfbc_src_dy;
+	if (sx < 0 || sy < 0) {
+		NVFBC_UNLOCK;
+		return 0;
 	}
-	if (y + h > nvfbc_last_frame.height) {
-		h = nvfbc_last_frame.height - y;
+
+	/*
+	 * Clamp in signed arithmetic.  The old form compared "x + w" against a
+	 * uint32_t, which promoted x and turned any overhang into a huge width.
+	 */
+	avail_w = (int)nvfbc_last_frame.width - sx;
+	avail_h = (int)nvfbc_last_frame.height - sy;
+	if (avail_w <= 0 || avail_h <= 0) {
+		NVFBC_UNLOCK;
+		return 0;
+	}
+	if ((int)w > avail_w) {
+		w = (unsigned int)avail_w;
+	}
+	if ((int)h > avail_h) {
+		h = (unsigned int)avail_h;
+	}
+	if ((int)h > dest->height) {
+		h = (unsigned int)dest->height;
 	}
 
 	for (line = 0; line < h; line++) {
-		src_row = nvfbc_frame_buffer + (y + line) * src_stride + x * 4;
-		dst_row = (uint8_t *)dest->data + line * dst_stride;
+		src_row = nvfbc_frame_buffer + (size_t)(sy + line) * src_stride + (size_t)sx * 4;
+		dst_row = (uint8_t *)dest->data + (size_t)line * dst_stride;
 
 		if (pixelsize == 4) {
-			/* Direct copy for 32bpp */
 			memcpy(dst_row, src_row, (size_t)w * 4);
-		} else if (pixelsize == 3) {
+		} else {
 			/* Convert BGRA to BGR for 24bpp */
 			unsigned int px;
 			for (px = 0; px < w; px++) {
@@ -276,13 +487,82 @@ static int nvfbc_copy_to_ximage(XImage *dest, int x, int y, unsigned int w, unsi
 				dst_row[px * 3 + 1] = src_row[px * 4 + 1];  /* G */
 				dst_row[px * 3 + 2] = src_row[px * 4 + 2];  /* R */
 			}
-		} else {
-			/* Unsupported depth, fall back */
-			return 0;
 		}
 	}
 
+	NVFBC_UNLOCK;
 	return 1;
+}
+
+/*
+ * Mark changed tiles straight from NVFBC's differential map.
+ *
+ * The map is generated on the GPU as a side effect of capture and, measured
+ * against an independent per-tile memcmp, never misses a change (it does
+ * over-report, which only costs a redundant tile copy).  It is a delta
+ * against the last frame we *captured*, so skipping generated frames is safe.
+ *
+ * With dwDiffMapScalingFactor == tile_x both grids are ceil(size/32), so a
+ * cell maps onto a tile 1:1 when the capture is cropped to the served region;
+ * the general form below also handles an uncropped capture.
+ *
+ * Returns the number of tiles marked, or -1 if the map is unusable.
+ */
+int nvfbc_mark_tiles_from_diffmap(void) {
+	uint8_t *map = NULL;
+	uint32_t mw = 0, mh = 0;
+	uint32_t scale = nvfbc_cfg.diff_map_scale;
+	int tx, ty, count = 0;
+
+	NVFBC_LOCK;
+	if (!use_nvfbc || !nvfbc_capture_active || !nvfbc_frame_ok ||
+	    !nvfbc_cfg.with_diff_map || scale == 0 ||
+	    tile_has_diff == NULL || ntiles_x <= 0 || ntiles_y <= 0 ||
+	    nvfbc_get_diff_map(&map, &mw, &mh) != NVFBC_CAP_OK || !map) {
+		NVFBC_UNLOCK;
+		return -1;
+	}
+
+	for (ty = 0; ty < ntiles_y; ty++) {
+		for (tx = 0; tx < ntiles_x; tx++) {
+			/* tile rect in served coords -> frame coords -> map cells */
+			int fx0 = tx * tile_x + nvfbc_src_dx;
+			int fy0 = ty * tile_y + nvfbc_src_dy;
+			int fx1 = fx0 + tile_x - 1;
+			int fy1 = fy0 + tile_y - 1;
+			int cx0, cx1, cy0, cy1, cx, cy, dirty = 0;
+
+			if (fx0 < 0) fx0 = 0;
+			if (fy0 < 0) fy0 = 0;
+			if (fx1 > (int)nvfbc_last_frame.width - 1)
+				fx1 = (int)nvfbc_last_frame.width - 1;
+			if (fy1 > (int)nvfbc_last_frame.height - 1)
+				fy1 = (int)nvfbc_last_frame.height - 1;
+			if (fx1 < fx0 || fy1 < fy0) {
+				continue;
+			}
+
+			cx0 = fx0 / (int)scale;  cx1 = fx1 / (int)scale;
+			cy0 = fy0 / (int)scale;  cy1 = fy1 / (int)scale;
+			if (cx1 > (int)mw - 1) cx1 = (int)mw - 1;
+			if (cy1 > (int)mh - 1) cy1 = (int)mh - 1;
+
+			for (cy = cy0; cy <= cy1 && !dirty; cy++) {
+				for (cx = cx0; cx <= cx1; cx++) {
+					if (map[(size_t)cy * mw + cx]) {
+						dirty = 1;
+						break;
+					}
+				}
+			}
+			if (dirty) {
+				tile_has_diff[tx + ty * ntiles_x] = 1;
+				count++;
+			}
+		}
+	}
+	NVFBC_UNLOCK;
+	return count;
 }
 #endif /* HAVE_NVFBC */
 

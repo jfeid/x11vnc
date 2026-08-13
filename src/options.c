@@ -249,6 +249,14 @@ int use_snapfb = 0;
 int use_nvfbc = 0;
 int nvfbc_with_cursor = 1;
 int nvfbc_with_diffmap = 1;
+/*
+ * Push model makes the driver generate a frame per damage event instead of
+ * sampling at dwSamplingRateMs.  Lower latency, but an application rendering
+ * far above our consumption rate then costs extra GPU work, so it is opt-in.
+ * Direct capture needs it (and an uncomposited cursor).
+ */
+int nvfbc_push_model = 0;
+int nvfbc_direct_capture = 0;
 
 int use_xrecord = 0;
 int noxrecord = 0;

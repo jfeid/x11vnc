@@ -105,6 +105,7 @@ extern MUTEX(scrollMutex);
 extern MUTEX(clientMutex);
 extern MUTEX(inputMutex);
 extern MUTEX(pointerMutex);
+extern MUTEX(nvfbcMutex);
 #endif
 
 #define X_INIT INIT_MUTEX(x11Mutex)
@@ -140,6 +141,16 @@ extern int hxl;
 #define POINTER_LOCK   if (use_threads) {LOCK(pointerMutex);}
 #define POINTER_UNLOCK if (use_threads) {UNLOCK(pointerMutex);}
 #define POINTER_INIT INIT_MUTEX(pointerMutex)
+
+/*
+ * NVFBC hands back a single buffer it overwrites on each grab.  The grab is
+ * deliberately done outside X_LOCK (it touches no X state, and a new-frame
+ * grab costs milliseconds that would otherwise stall XTest input), so X_LOCK
+ * no longer serialises grabs against readers.  This does.
+ */
+#define NVFBC_LOCK   if (use_threads) {LOCK(nvfbcMutex);}
+#define NVFBC_UNLOCK if (use_threads) {UNLOCK(nvfbcMutex);}
+#define NVFBC_INIT INIT_MUTEX(nvfbcMutex)
 
 /*
  * The sendMutex member was added to libvncserver 0.9.8

@@ -214,6 +214,8 @@ extern int use_snapfb;
 extern int use_nvfbc;
 extern int nvfbc_with_cursor;
 extern int nvfbc_with_diffmap;
+extern int nvfbc_push_model;
+extern int nvfbc_direct_capture;
 
 extern int use_xrecord;
 extern int noxrecord;

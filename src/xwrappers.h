@@ -86,6 +86,17 @@ extern void init_track_keycode_state(void);
 extern int nvfbc_capture_init(void);
 extern void nvfbc_capture_cleanup(void);
 extern int nvfbc_capture_is_active(void);
+/* Take one coherent frame for the whole scan cycle; call outside X_LOCK. */
+extern void nvfbc_begin_frame(void);
+/* Drop the cached frame so the next read re-grabs. */
+extern void nvfbc_invalidate_frame(void);
+/* Same, but only when not inside a scan cycle (see copy_screen). */
+extern void nvfbc_invalidate_if_out_of_cycle(void);
+extern void nvfbc_set_in_scan_cycle(int v);
+/* 1 new frame, 0 same frame as last cycle, -1 unknown. */
+extern int nvfbc_frame_is_new(void);
+/* Populate tile_has_diff[] from the diff map; returns tiles marked or -1. */
+extern int nvfbc_mark_tiles_from_diffmap(void);
 #endif
 
 extern void XTRAP_FakeKeyEvent_wr(Display* dpy, KeyCode key, Bool down,

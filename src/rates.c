@@ -247,6 +247,13 @@ void initialize_speeds(void) {
 		}
 #endif
 
+#if HAVE_NVFBC
+		/* this times a framebuffer read, so it must not be served from
+		 * the current scan cycle's cached frame */
+		if (use_nvfbc) {
+			nvfbc_invalidate_frame();
+		}
+#endif
 		dtime0(&timer);
 		if (fullscreen) {
 			copy_image(fullscreen, 0, 0, 0, 0);

@@ -2461,6 +2461,11 @@ int copy_screen(void) {
 		return 0;
 	}
 
+#if HAVE_NVFBC
+	/* fresh frame when called from outside a scan cycle, reuse within one */
+	nvfbc_invalidate_if_out_of_cycle();
+#endif
+
 	block_size = ((dpy_y/fs_factor) * main_bytes_per_line);
 
 	fbp = main_fb;
@@ -3392,13 +3397,19 @@ int scanlines[NSCAN] = {
 int scan_for_updates(int count_only) {
 	int i, tile_count, tile_diffs;
 	int old_copy_tile;
+	/*
+	 * Set when NVFBC's diff map has already established tile_has_diff[], in
+	 * which case every scan_display() below would only re-derive what we
+	 * already know.  Always 0 without NVFBC.
+	 */
+	int nvfbc_scanned = 0;
 	double frac1 = 0.1;   /* tweak parameter to try a 2nd scan_display() */
 	double frac2 = 0.35;  /* or 3rd */
 	double frac3 = 0.02;  /* do scan_display() again after copy_tiles() */
 	static double last_poll = 0.0;
 
 	if (unixpw_in_progress) return 0;
- 
+
 	if (slow_fb > 0.0) {
 		double now = dnow();
 		if (now < last_poll + slow_fb) {
@@ -3406,6 +3417,15 @@ int scan_for_updates(int count_only) {
 		}
 		last_poll = now;
 	}
+
+#if HAVE_NVFBC
+	/*
+	 * Take this cycle's frame up front, outside X_LOCK.  Every copy_image()
+	 * below is then served from it, so the scan sees one coherent snapshot
+	 * instead of re-grabbing per scanline and per tile run.
+	 */
+	nvfbc_begin_frame();
+#endif
 
 	for (i=0; i < ntiles; i++) {
 		tile_has_diff[i] = 0;
@@ -3470,8 +3490,38 @@ int scan_for_updates(int count_only) {
 
 	/* scan with the initial y to the jitter value from scanlines: */
 	scan_in_progress = 1;
-	tile_count = scan_display(scanlines[scan_count], 0);
-	SCAN_FATAL(tile_count);
+
+#if HAVE_NVFBC
+	/*
+	 * With NVFBC the sparse scanline sampling is redundant: the capture
+	 * already produced the whole frame plus a per-tile dirty map, so both
+	 * the scan and its rescans are pure overhead.
+	 *
+	 * nvfbc_scanned records that tile_has_diff[] is already authoritative,
+	 * which also suppresses the rescan passes further down.
+	 */
+	nvfbc_scanned = 0;
+	if (use_nvfbc && nvfbc_capture_is_active()) {
+		int isnew = nvfbc_frame_is_new();
+
+		if (isnew == 0) {
+			/* display produced nothing new, so no pixel can differ */
+			tile_count = 0;
+			nvfbc_scanned = 1;
+		} else if (isnew == 1) {
+			int marked = nvfbc_mark_tiles_from_diffmap();
+			if (marked >= 0) {
+				tile_count = marked;
+				nvfbc_scanned = 1;
+			}
+		}
+	}
+	if (!nvfbc_scanned)
+#endif
+	{
+		tile_count = scan_display(scanlines[scan_count], 0);
+		SCAN_FATAL(tile_count);
+	}
 
 	/*
 	 * we do the XDAMAGE here too since after scan_display()
@@ -3515,7 +3565,9 @@ int scan_for_updates(int count_only) {
 			}
 		}
 	}
-	if (dpy && use_xdamage == 1) {
+	/* the XDAMAGE accuracy probe re-scans the screen; pointless when the
+	 * diff map, not XDAMAGE, is what drives tile marking */
+	if (dpy && use_xdamage == 1 && !nvfbc_scanned) {
 		static time_t last_xd_check = 0;
 		if (time(NULL) > last_xd_check + 2) {
 			int cp = (scan_count + 3) % NSCAN;
@@ -3558,7 +3610,7 @@ int scan_for_updates(int count_only) {
 		 */
 
 		/* this check is done to skip the extra scan_display() call */
-		if (! fs_factor || tile_count <= fs_frac * ntiles) {
+		if (!nvfbc_scanned && (! fs_factor || tile_count <= fs_frac * ntiles)) {
 			int cp, tile_count_old = tile_count;
 			
 			/* choose a different y shift for the 2nd scan: */
@@ -3593,7 +3645,14 @@ int scan_for_updates(int count_only) {
 		if (fs_factor && tile_count > fs_frac * ntiles) {
 			int cs;
 			fb_copy_in_progress = 1;
+#if HAVE_NVFBC
+			/* this copy belongs to the cycle: reuse its frame */
+			nvfbc_set_in_scan_cycle(1);
+#endif
 			cs = copy_screen();
+#if HAVE_NVFBC
+			nvfbc_set_in_scan_cycle(0);
+#endif
 			fb_copy_in_progress = 0;
 			SCAN_FATAL(cs);
 			if (use_threads && pointer_mode != 1) {
@@ -3638,7 +3697,7 @@ int scan_for_updates(int count_only) {
 	tile_diffs = copy_tiles_backward_pass();
 	SCAN_FATAL(tile_diffs);
 
-	if (tile_diffs > frac3 * ntiles) {
+	if (!nvfbc_scanned && tile_diffs > frac3 * ntiles) {
 		/*
 		 * we spent a lot of time in those copy_tiles, run
 		 * another scan, maybe more of the screen changed.

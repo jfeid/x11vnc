@@ -50,6 +50,7 @@ MUTEX(scrollMutex);
 MUTEX(clientMutex);
 MUTEX(inputMutex);
 MUTEX(pointerMutex);
+MUTEX(nvfbcMutex);
 #endif
 
 int nfix(int i, int n);

@@ -217,6 +217,30 @@ nvfbc_cap_status_t nvfbc_get_status(nvfbc_status_t *status) {
     return NVFBC_CAP_OK;
 }
 
+int nvfbc_find_output_by_box(const nvfbc_status_t *status,
+                             uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                             uint32_t *out_id, const char **out_name) {
+    uint32_t i;
+
+    if (!status || w == 0 || h == 0) {
+        return 0;
+    }
+
+    for (i = 0; i < status->num_outputs && i < 5; i++) {
+        if (status->outputs[i].x == x && status->outputs[i].y == y &&
+            status->outputs[i].width == w && status->outputs[i].height == h) {
+            if (out_id) {
+                *out_id = status->outputs[i].id;
+            }
+            if (out_name) {
+                *out_name = status->outputs[i].name;
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
 nvfbc_cap_status_t nvfbc_start_capture(const nvfbc_config_t *config) {
     NVFBC_CREATE_CAPTURE_SESSION_PARAMS session_params = {0};
     NVFBC_TOSYS_SETUP_PARAMS setup_params = {0};
@@ -252,12 +276,38 @@ nvfbc_cap_status_t nvfbc_start_capture(const nvfbc_config_t *config) {
     session_params.bPushModel = nvfbc_state.config.push_model ? NVFBC_TRUE : NVFBC_FALSE;
     session_params.bDisableAutoModesetRecovery = NVFBC_FALSE;
 
+    /*
+     * Direct capture lets NVFBC attach straight to a fullscreen unoccluded
+     * application and bypass the X server.  The driver only honours it when
+     * push model is on and the cursor is not composited.
+     */
+    session_params.bAllowDirectCapture =
+        (nvfbc_state.config.allow_direct_capture &&
+         nvfbc_state.config.push_model &&
+         !nvfbc_state.config.with_cursor) ? NVFBC_TRUE : NVFBC_FALSE;
+
     /* Configure tracking */
     if (nvfbc_state.config.track_output >= 0) {
         session_params.eTrackingType = NVFBC_TRACKING_OUTPUT;
         session_params.dwOutputId = (uint32_t)nvfbc_state.config.track_output;
     } else {
         session_params.eTrackingType = NVFBC_TRACKING_SCREEN;
+
+        /*
+         * Crop the tracked screen down to the region we actually serve.
+         * captureBox on its own is ignored by the driver - frameSize must be
+         * programmed to the same dimensions or the full screen comes back.
+         */
+        if (nvfbc_state.config.box_w > 0 && nvfbc_state.config.box_h > 0) {
+            session_params.captureBox.x = nvfbc_state.config.box_x;
+            session_params.captureBox.y = nvfbc_state.config.box_y;
+            session_params.captureBox.w = nvfbc_state.config.box_w;
+            session_params.captureBox.h = nvfbc_state.config.box_h;
+            session_params.frameSize.w  = nvfbc_state.config.box_w;
+            session_params.frameSize.h  = nvfbc_state.config.box_h;
+            /* RGB formats have no rounding constraints; keep the exact size */
+            session_params.bRoundFrameSize = NVFBC_FALSE;
+        }
     }
 
     ret = nvfbc_state.api.nvFBCCreateCaptureSession(nvfbc_state.session, &session_params);

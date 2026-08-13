@@ -3922,6 +3922,26 @@ int main(int argc, char* argv[]) {
 			nvfbc_with_diffmap = 0;
 			continue;
 		}
+		if (!strcmp(arg, "-nvfbc_push")) {
+			nvfbc_push_model = 1;
+			continue;
+		}
+		if (!strcmp(arg, "-nvfbc_nopush")) {
+			nvfbc_push_model = 0;
+			continue;
+		}
+		if (!strcmp(arg, "-nvfbc_direct")) {
+			/* direct capture is only honoured with push model and an
+			 * uncomposited cursor, so imply both */
+			nvfbc_direct_capture = 1;
+			nvfbc_push_model = 1;
+			nvfbc_with_cursor = 0;
+			continue;
+		}
+		if (!strcmp(arg, "-nvfbc_nodirect")) {
+			nvfbc_direct_capture = 0;
+			continue;
+		}
 #endif
 		if (!strcmp(arg, "-rand")) {
 			/* equiv. to -nopw -rawfb rand for quick tests */
@@ -5010,6 +5030,7 @@ int main(int argc, char* argv[]) {
 	CLIENT_INIT;
 	INPUT_INIT;
 	POINTER_INIT;
+	NVFBC_INIT;
 	
 	/* open the X display: */
 

@@ -391,6 +391,7 @@ nvfbc_cap_status_t nvfbc_grab_frame(uint8_t **buffer,
         frame_info->byte_size = info.dwByteSize;
         frame_info->frame_id = info.dwCurrentFrame;
         frame_info->is_new_frame = (info.bIsNewFrame == NVFBC_TRUE) ? 1 : 0;
+        frame_info->is_direct_capture = (info.bDirectCapture == NVFBC_TRUE) ? 1 : 0;
         frame_info->timestamp_us = info.ulTimestampUs;
     }
 

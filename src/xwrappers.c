@@ -96,6 +96,7 @@ static nvfbc_config_t nvfbc_cfg;
 /* NVFBC performance tracking */
 static unsigned long nvfbc_frame_count = 0;
 static unsigned long nvfbc_new_frame_count = 0;
+static unsigned long nvfbc_direct_count = 0;
 static struct timeval nvfbc_stats_start;
 static int nvfbc_stats_initialized = 0;
 
@@ -330,16 +331,22 @@ static int nvfbc_grab_current(void) {
 	nvfbc_frame_count++;
 	if (nvfbc_last_frame.is_new_frame) {
 		nvfbc_new_frame_count++;
+		if (nvfbc_last_frame.is_direct_capture) {
+			nvfbc_direct_count++;
+		}
 	}
 	elapsed = (now.tv_sec - nvfbc_stats_start.tv_sec) +
 	          (now.tv_usec - nvfbc_stats_start.tv_usec) / 1000000.0;
 	if (elapsed >= 10.0) {
-		rfbLog("NVFBC stats: %.1f new fps, %.0f grabs/sec, %lu new frames / %lu total grabs\n",
+		/* appended, not inserted: existing tooling parses the prefix */
+		rfbLog("NVFBC stats: %.1f new fps, %.0f grabs/sec, %lu new frames / %lu total grabs%s\n",
 		       nvfbc_new_frame_count / elapsed, nvfbc_frame_count / elapsed,
-		       nvfbc_new_frame_count, nvfbc_frame_count);
+		       nvfbc_new_frame_count, nvfbc_frame_count,
+		       nvfbc_direct_count ? " [direct capture active]" : "");
 		nvfbc_stats_start = now;
 		nvfbc_frame_count = 0;
 		nvfbc_new_frame_count = 0;
+		nvfbc_direct_count = 0;
 	}
 
 	nvfbc_frame_ok = 1;

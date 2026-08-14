@@ -37,6 +37,9 @@ typedef struct {
     uint32_t byte_size;         /* Total frame size in bytes */
     uint32_t frame_id;          /* Incremental frame counter */
     int is_new_frame;           /* 1 if this is a new frame, 0 if duplicate */
+    int is_direct_capture;      /* 1 if NVFBC bypassed X and took it straight
+                                 * from a fullscreen app (see
+                                 * allow_direct_capture) */
     uint64_t timestamp_us;      /* Capture timestamp in microseconds */
 } nvfbc_frame_info_t;
 

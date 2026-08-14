@@ -245,6 +245,92 @@ static char *flip_ximage_byte_order(XImage *xim) {
 /*
  * set up an XShm image, or if not using shm just create the XImage.
  */
+#if HAVE_XSHM
+/*
+ * Which user is the X server running as?
+ *
+ * Derived from the display's unix socket rather than anything X tells us,
+ * because we need it before we have successfully attached anything.
+ * Returns (uid_t)-1 when it cannot be determined (e.g. a remote display,
+ * where MIT-SHM does not apply anyway).
+ */
+static uid_t xserver_uid(void) {
+	const char *d, *colon;
+	char path[256];
+	struct stat sb;
+	int num;
+
+	if (! dpy) {
+		return (uid_t) -1;
+	}
+	d = DisplayString(dpy);
+	if (! d) {
+		return (uid_t) -1;
+	}
+	colon = strrchr(d, ':');
+	if (! colon || ! isdigit((unsigned char) colon[1])) {
+		return (uid_t) -1;
+	}
+	num = atoi(colon + 1);
+	if (num < 0) {
+		return (uid_t) -1;
+	}
+	snprintf(path, sizeof(path), "/tmp/.X11-unix/X%d", num);
+	if (stat(path, &sb) != 0) {
+		return (uid_t) -1;
+	}
+	return sb.st_uid;
+}
+
+/*
+ * We create the MIT-SHM segment but the X server is what attaches to it, so
+ * the server needs access.  The 0600 below only works when we and the X
+ * server are the same user; a root x11vnc against a user-owned rootless Xorg
+ * gets X_ShmAttach BadAccess, which is fatal rather than a graceful fallback.
+ *
+ * Hand the segment to the X server's uid instead of widening the mode: it
+ * holds framebuffer contents, so 0666 would let any local user read the
+ * screen.  Only root can give a segment away, and root keeps access to it
+ * regardless, so this is a no-op for the same-user case.
+ */
+static void shm_grant_xserver(int shmid, char *name) {
+	static int reported = 0;
+	struct shmid_ds ds;
+	uid_t xuid = xserver_uid();
+
+	if (xuid == (uid_t) -1 || xuid == geteuid()) {
+		return;		/* same user, or unknowable: 0600 is fine */
+	}
+	if (geteuid() != 0) {
+		if (! reported) {
+			rfbLog("shm_create(%s): X server runs as uid %d but we are "
+			    "uid %d and not root; MIT-SHM attach will likely fail.\n",
+			    name, (int) xuid, (int) geteuid());
+			reported = 1;
+		}
+		return;
+	}
+
+	memset(&ds, 0, sizeof(ds));
+	if (shmctl(shmid, IPC_STAT, &ds) != 0) {
+		rfbLogPerror("shmctl(IPC_STAT)");
+		return;
+	}
+	ds.shm_perm.uid = xuid;
+	if (shmctl(shmid, IPC_SET, &ds) != 0) {
+		rfbLog("shm_create(%s): could not hand segment to uid %d\n",
+		    name, (int) xuid);
+		rfbLogPerror("shmctl(IPC_SET)");
+		return;
+	}
+	if (! reported) {
+		rfbLog("MIT-SHM: handing segments to X server uid %d "
+		    "(we are uid 0)\n", (int) xuid);
+		reported = 1;
+	}
+}
+#endif
+
 static int shm_create(XShmSegmentInfo *shm, XImage **ximg_ptr, int w, int h,
     char *name) {
 
@@ -351,6 +437,9 @@ static int shm_create(XShmSegmentInfo *shm, XImage **ximg_ptr, int w, int h,
 	}
 
 	shm->readOnly = False;
+
+	/* we are mapped now; let the X server in before it tries to attach */
+	shm_grant_xserver(shm->shmid, name);
 
 	if (! XShmAttach_wr(dpy, shm)) {
 		rfbErr("XShmAttach(%s) failed.\n", name);

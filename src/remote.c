@@ -5094,6 +5094,71 @@ char *process_remote_cmd(char *cmd, int stringonly) {
 
 		goto done;
 	}
+#if HAVE_NVFBC
+	/*
+	 * NVFBC tuning.  Every one of these is fixed at capture-session
+	 * creation, so setting one restarts the session; see
+	 * nvfbc_capture_reconfigure().
+	 *
+	 * "nvfbc" itself is read-only (below, with the other aro variables):
+	 * turning it off at runtime would leave x11vnc on the XGetSubImage
+	 * path, because the MIT-SHM polling images were never created when
+	 * NVFBC came up, and re-creating them means rebuilding the
+	 * framebuffer under a live session.
+	 */
+#define NVFBC_TOGGLE(onname, offname, var, what) \
+	if (!strcmp(p, onname) || !strcmp(p, offname)) { \
+		int on = !strcmp(p, onname); \
+		int orig = var; \
+		if (query) { \
+			snprintf(buf, bufn, "ans=%s:%d", p, on ? var : !var); \
+			goto qry; \
+		} \
+		if (!use_nvfbc) { \
+			rfbLog("remote_cmd: %s: NVFBC is not in use.\n", p); \
+			goto done; \
+		} \
+		rfbLog("remote_cmd: turning %s NVFBC %s.\n", on ? "on":"off", what); \
+		var = on; \
+		if (orig != var) { \
+			nvfbc_capture_reconfigure(); \
+		} \
+		goto done; \
+	}
+
+	NVFBC_TOGGLE("nvfbc_cursor",  "nvfbc_nocursor",  nvfbc_with_cursor,   "cursor")
+	NVFBC_TOGGLE("nvfbc_diffmap", "nvfbc_nodiffmap", nvfbc_with_diffmap,  "diffmap")
+	NVFBC_TOGGLE("nvfbc_push",    "nvfbc_nopush",    nvfbc_push_model,    "push model")
+
+#undef NVFBC_TOGGLE
+
+	/* direct capture is only honoured with push model and no cursor, so
+	 * enabling it implies both, exactly as the command line does */
+	if (!strcmp(p, "nvfbc_direct") || !strcmp(p, "nvfbc_nodirect")) {
+		int on = !strcmp(p, "nvfbc_direct");
+		int orig = nvfbc_direct_capture;
+		if (query) {
+			snprintf(buf, bufn, "ans=%s:%d", p,
+			    on ? nvfbc_direct_capture : !nvfbc_direct_capture);
+			goto qry;
+		}
+		if (!use_nvfbc) {
+			rfbLog("remote_cmd: %s: NVFBC is not in use.\n", p);
+			goto done;
+		}
+		rfbLog("remote_cmd: turning %s NVFBC direct capture.\n", on ? "on":"off");
+		nvfbc_direct_capture = on;
+		if (on) {
+			nvfbc_push_model = 1;
+			nvfbc_with_cursor = 0;
+		}
+		if (orig != nvfbc_direct_capture) {
+			nvfbc_capture_reconfigure();
+		}
+		goto done;
+	}
+#endif	/* HAVE_NVFBC */
+
 	if (strstr(p, "rawfb") == p) {
 		COLON_CHECK("rawfb:")
 		if (query) {
@@ -5842,6 +5907,16 @@ char *process_remote_cmd(char *cmd, int stringonly) {
 					snprintf(buf, bufn, "aro=%s:%s", p, d);
 				}
 			}
+			goto qry;
+		}
+		if (!strcmp(p, "nvfbc")) {
+#if HAVE_NVFBC
+			/* read-only: see the note by the nvfbc_* setters */
+			snprintf(buf, bufn, "aro=%s:%d", p,
+			    (use_nvfbc && nvfbc_capture_is_active()) ? 1 : 0);
+#else
+			snprintf(buf, bufn, "aro=%s:%d", p, 0);
+#endif
 			goto qry;
 		}
 		if (!strcmp(p, "vncdisplay")) {

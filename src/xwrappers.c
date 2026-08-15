@@ -354,6 +354,52 @@ static int nvfbc_grab_current(void) {
 }
 
 /*
+ * Re-apply the NVFBC option globals to the running capture.
+ *
+ * bWithCursor, bWithDiffMap, bPushModel and bAllowDirectCapture are all fixed
+ * at session creation, so changing one of the corresponding options means
+ * tearing the session down and building it again - flipping the global alone
+ * would do nothing at all.
+ *
+ * Returns 1 if capture is running afterwards, 0 if it could not be restarted
+ * (in which case reads fall back to the X paths, which is slow but correct).
+ */
+int nvfbc_capture_reconfigure(void) {
+	int ok;
+
+	if (!use_nvfbc || !nvfbc_initialized) {
+		return 0;
+	}
+
+	NVFBC_LOCK;
+
+	nvfbc_cfg.with_cursor = nvfbc_with_cursor;
+	nvfbc_cfg.with_diff_map = nvfbc_with_diffmap;
+	nvfbc_cfg.push_model = nvfbc_push_model;
+	nvfbc_cfg.allow_direct_capture = nvfbc_direct_capture;
+
+	nvfbc_stop_capture();
+	nvfbc_capture_active = 0;
+
+	ok = nvfbc_start_configured_capture();
+	if (ok) {
+		nvfbc_capture_active = 1;
+		/* the cached frame belongs to the old session */
+		nvfbc_grabbed_epoch = ~0UL;
+		nvfbc_frame_ok = 0;
+		rfbLog("NVFBC: capture session restarted (cursor=%d, diffmap=%d, "
+		    "push=%d, direct=%d)\n", nvfbc_with_cursor, nvfbc_with_diffmap,
+		    nvfbc_push_model, nvfbc_direct_capture);
+	} else {
+		rfbLog("NVFBC: *** capture session could not be restarted; "
+		    "falling back to X11 reads ***\n");
+	}
+
+	NVFBC_UNLOCK;
+	return ok;
+}
+
+/*
  * Begin a capture cycle: take one coherent frame for the whole scan.
  *
  * Called from scan_for_updates() before it takes X_LOCK.  The grab itself

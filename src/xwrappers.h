@@ -97,6 +97,8 @@ extern void nvfbc_set_in_scan_cycle(int v);
 extern int nvfbc_frame_is_new(void);
 /* Populate tile_has_diff[] from the diff map; returns tiles marked or -1. */
 extern int nvfbc_mark_tiles_from_diffmap(void);
+/* Re-apply the nvfbc_* option globals by restarting the capture session. */
+extern int nvfbc_capture_reconfigure(void);
 #endif
 
 extern void XTRAP_FakeKeyEvent_wr(Display* dpy, KeyCode key, Bool down,

@@ -88,6 +88,19 @@ AC_ARG_WITH(nvfbc,
 [  --with-nvfbc            enable NVFBC capture (auto-detected at runtime)],,)
 if test "x$with_nvfbc" != "xno"; then
 	# NVFBC is loaded dynamically at runtime via dlopen, so we only need dl
+dnl h264/NVENC encoding (docs/NVENC-H264-PLAN.md). Optional: without it the
+dnl encoding-50 transport still builds, only live encoding is unavailable.
+AC_ARG_WITH(ffmpeg, [  --without-ffmpeg        disable NVENC H.264 encoding],,)
+if test "x$with_ffmpeg" != "xno"; then
+	PKG_CHECK_MODULES(FFMPEG, [libavcodec libavutil libswscale],
+		[AC_DEFINE(HAVE_FFMPEG, 1, [Define if libavcodec is available])
+		 HAVE_FFMPEG="true"],
+		[AC_MSG_WARN([libavcodec not found - -h264 live encoding disabled])
+		 HAVE_FFMPEG="false"])
+fi
+AC_SUBST(FFMPEG_CFLAGS)
+AC_SUBST(FFMPEG_LIBS)
+
 	AC_CHECK_LIB(dl, dlopen,
 		NVFBC_LIBS="-ldl"
 		[AC_DEFINE(HAVE_NVFBC) HAVE_NVFBC="true"],

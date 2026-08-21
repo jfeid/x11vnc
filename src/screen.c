@@ -33,6 +33,7 @@ so, delete this exception statement from your version.
 /* -- screen.c -- */
 
 #include "x11vnc.h"
+#include "h264/h264_stream.h"
 #include "xevents.h"
 #include "xwrappers.h"
 #include "xinerama.h"
@@ -3846,6 +3847,13 @@ void initialize_screen(int *argc, char **argv, XImage *fb) {
 		defer_update = screen->deferUpdateTime;
 	}
 
+	/* must precede rfbInitServer(): the extension has to be registered
+	 * before any client can send SetEncodings */
+	h264_stream_init();
+	if (h264_testfile_path != NULL) {
+		h264_testfile_load(h264_testfile_path);
+	}
+
 	if (noipv4 || getenv("IPV4_FAILS")) {
 		rfbBool ap = screen->autoPort;
 		int port = screen->port;
@@ -4843,6 +4851,16 @@ void watch_loop(void) {
 
 			/* important to have this here since it draws cursors into framebuffer */
 			check_cursor_changes();
+
+			/*
+			 * Last thing inside the send ban: the H.264 tick both
+			 * encodes and clears modifiedRegion for its clients.
+			 * It has to run after check_cursor_changes(), which
+			 * draws the cursor into the framebuffer and re-marks
+			 * the region - doing it earlier leaves Tight to resend
+			 * areas the next H.264 frame repaints anyway.
+			 */
+			h264_frame_tick(tile_diffs);
 
 			/* 
 			   Release the send ban again.

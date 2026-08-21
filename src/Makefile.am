@@ -155,5 +155,13 @@ x11vnc_SOURCES += \
 	nvfbc/nvfbc_capture.c \
 	nvfbc/nvfbc_capture.h \
 	nvfbc/NvFBC.h
+
+x11vnc_SOURCES += \
+	h264/h264_stream.c \
+	h264/h264_stream.h \
+	h264/h264_encode.c \
+	h264/h264_encode.h
+AM_CPPFLAGS += $(FFMPEG_CFLAGS)
+x11vnc_LDADD += $(FFMPEG_LIBS)
 AM_CPPFLAGS += -I$(srcdir)/nvfbc
 endif

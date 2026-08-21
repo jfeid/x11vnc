@@ -133,6 +133,8 @@
 /* -- x11vnc.c -- */
 
 #include "x11vnc.h"
+#include "h264/h264_stream.h"
+#include "h264/h264_encode.h"
 #include "xwrappers.h"
 #include "xdamage.h"
 #include "xrecord.h"
@@ -3924,6 +3926,39 @@ int main(int argc, char* argv[]) {
 		}
 		if (!strcmp(arg, "-nvfbc_push")) {
 			nvfbc_push_model = 1;
+			continue;
+		}
+		if (!strcmp(arg, "-h264")) {
+			h264_enable = 1;
+			continue;
+		}
+		if (!strcmp(arg, "-h264_bitrate")) {
+			CHECK_ARGC
+			h264_bitrate_kbps = atoi(argv[++i]);
+			continue;
+		}
+		if (!strcmp(arg, "-h264_fps")) {
+			CHECK_ARGC
+			h264_fps = atoi(argv[++i]);
+			continue;
+		}
+		if (!strcmp(arg, "-h264_enter")) {
+			CHECK_ARGC
+			h264_enter_rate = (int) (atof(argv[++i]) * 100);
+			continue;
+		}
+		if (!strcmp(arg, "-h264_exit")) {
+			CHECK_ARGC
+			h264_exit_rate = (int) (atof(argv[++i]) * 100);
+			continue;
+		}
+		if (!strcmp(arg, "-h264_force")) {
+			h264_force = 1;
+			continue;
+		}
+		if (!strcmp(arg, "-h264_testfile")) {
+			CHECK_ARGC
+			h264_testfile_path = strdup(argv[++i]);
 			continue;
 		}
 		if (!strcmp(arg, "-nvfbc_nopush")) {

@@ -14,10 +14,15 @@
 #include "h264/h264_stream.h"
 #include "h264/h264_encode.h"
 #include <sys/time.h>
+#include <sys/ioctl.h>
+#include <linux/sockios.h>
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static int h264_fits(rfbClientPtr cl, unsigned int len);
+static int h264_last_refused = 0;       /* clients that could not take the last frame */
 
 int h264_force = 0;             /* -h264_force: assume every client wants it */
 char *h264_testfile_path = NULL;
@@ -138,6 +143,14 @@ int h264_send_rect(rfbClientPtr cl, int x, int y, int w, int h,
 	int ok = 1;
 
 	if (cl == NULL || data == NULL) {
+		return 0;
+	}
+
+	/*
+	 * Refuse rather than block.  The caller forces an IDR after a refusal,
+	 * because skipping an access unit breaks P-frame prediction.
+	 */
+	if (!h264_fits(cl, len)) {
 		return 0;
 	}
 
@@ -379,6 +392,76 @@ static int h264_active_clients(void) {
 }
 
 /*
+ * Unsent bytes still queued on a client's socket.
+ *
+ * h264_send_rect() writes with rfbWriteExact(), which loops until every byte
+ * is gone, and it runs inside watch_loop's send ban holding every client's
+ * sendMutex.  So a client that cannot drain the stream does not just fall
+ * behind - it stalls the whole server, and because H.264 mode suppresses Tight
+ * there is nothing else to paint with.  The session freezes with the
+ * connection still up and recovers only when the backlog clears.
+ *
+ * Checking the queue before encoding turns that into dropped frames instead.
+ */
+static int h264_backlog(rfbClientPtr cl) {
+	int q = 0;
+
+	if (cl == NULL || cl->sock < 0) {
+		return 0;
+	}
+	if (ioctl(cl->sock, SIOCOUTQ, &q) != 0) {
+		return 0;               /* cannot tell; assume clear */
+	}
+	return q;
+}
+
+/* Largest backlog we will add another access unit on top of. */
+#define H264_BACKLOG_LIMIT (512 * 1024)
+
+/*
+ * Will this whole access unit fit in the socket's remaining send buffer?
+ *
+ * Checking the backlog alone is not enough: rfbWriteExact() loops until every
+ * byte is written, so starting a 100 KB write with only 20 KB of room blocks
+ * watch_loop anyway.  That is not merely a stall - x11vnc processes signals
+ * from the main loop, so a blocked write also means SIGTERM is never seen and
+ * `systemctl restart` sits there until its stop timeout expires.
+ *
+ * Linux reports SO_SNDBUF as roughly twice the usable size, hence the halving.
+ */
+static int h264_fits(rfbClientPtr cl, unsigned int len) {
+	int q = 0, sndbuf = 0;
+	socklen_t sl = sizeof(sndbuf);
+
+	if (cl == NULL || cl->sock < 0) {
+		return 0;
+	}
+	if (ioctl(cl->sock, SIOCOUTQ, &q) != 0 ||
+	    getsockopt(cl->sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, &sl) != 0) {
+		return 1;               /* cannot tell; let it through */
+	}
+	return (q + (int) len + 256) < (sndbuf / 2);
+}
+
+/* True if any H.264 client is too far behind to take another frame. */
+static int h264_clients_backed_up(void) {
+	rfbClientIteratorPtr iter;
+	rfbClientPtr cl;
+	int busy = 0;
+
+	iter = rfbGetClientIterator(screen);
+	while ((cl = rfbClientIteratorNext(iter)) != NULL) {
+		if (h264_client_active(cl) &&
+		    h264_backlog(cl) > H264_BACKLOG_LIMIT) {
+			busy = 1;
+			break;
+		}
+	}
+	rfbReleaseClientIterator(iter);
+	return busy;
+}
+
+/*
  * While H.264 owns the served region, Tight must not paint over it - on every
  * cycle, not only the ones that carry an encode. watch_loop runs far faster
  * than the encode rate, so leaving the intervening cycles to Tight sends the
@@ -404,16 +487,39 @@ static int h264_broadcast(int w, int h, const unsigned char *au,
     unsigned int len, unsigned int flags, int suppress_tight) {
 	rfbClientIteratorPtr iter;
 	rfbClientPtr cl;
-	int sent = 0;
+	int sent = 0, refused = 0;
 
 	iter = rfbGetClientIterator(screen);
 	while ((cl = rfbClientIteratorNext(iter)) != NULL) {
 		if (!h264_client_active(cl)) {
 			continue;
 		}
+		/*
+		 * Only send if the client has actually asked for an update.
+		 *
+		 * This is RFB's flow control and libvncserver's own encoders
+		 * obey it; pushing frames on a timer regardless does not just
+		 * waste bandwidth, it removes the only signal a slow client
+		 * has to say "ease off".  A viewer decoding 2560x1440 H.264
+		 * in software falls behind under sustained full-screen change,
+		 * stops requesting, and the frames it never asked for pile up
+		 * in the tunnel - so the picture it shows is a minute stale
+		 * while the server looks perfectly healthy.  The socket queue
+		 * shows nothing either, because sshd drains it eagerly into
+		 * buffers of its own.
+		 */
+		if (sraRgnEmpty(cl->requestedRegion)) {
+			refused++;
+			continue;
+		}
 		if (!h264_send_rect(cl, 0, 0, w, h, au, len, flags)) {
-			rfbLog("h264: send failed for %s\n",
-			    cl->host ? cl->host : "?");
+			/*
+			 * Either the socket could not take the whole unit or
+			 * the write failed.  Do not clear modifiedRegion:
+			 * this client did not get the frame, so Tight must
+			 * still be allowed to paint for it.
+			 */
+			refused++;
 			continue;
 		}
 		/*
@@ -424,9 +530,12 @@ static int h264_broadcast(int w, int h, const unsigned char *au,
 		if (suppress_tight) {
 			sraRgnMakeEmpty(cl->modifiedRegion);
 		}
+		/* the request is now satisfied, as libvncserver does after an update */
+		sraRgnMakeEmpty(cl->requestedRegion);
 		sent++;
 	}
 	rfbReleaseClientIterator(iter);
+	h264_last_refused = refused;
 	return sent;
 }
 
@@ -449,6 +558,7 @@ static double above_since = 0.0, below_since = 0.0;
 static double clients_since = 0.0;      /* when a client first wanted H.264 */
 static int exclusive = 0;               /* every client is on H.264 right now */
 static int initial_paint_done = 0;      /* connect-time Tight backlog has drained */
+static double stalled_since = 0.0;      /* when the client first fell behind */
 
 int h264_owns_output(void) {
 	return exclusive;
@@ -584,6 +694,7 @@ void h264_frame_tick(int tile_diffs) {
 			clients_since = 0.0;
 			exclusive = 0;
 			initial_paint_done = 0;
+			stalled_since = 0.0;
 			if (h264_enc_is_open()) {
 				h264_enc_close();
 				need_idr = 1;
@@ -622,6 +733,35 @@ void h264_frame_tick(int tile_diffs) {
 			need_idr = 1;
 			return;
 		}
+
+		/*
+		 * Back off before encoding if the client is behind.  Dropping
+		 * a frame breaks P-frame prediction, so whatever we send next
+		 * has to be an IDR.
+		 */
+		if (h264_clients_backed_up()) {
+			if (stalled_since == 0.0) {
+				stalled_since = t;
+			}
+			need_idr = 1;
+			/*
+			 * Persistently behind means H.264 is simply too much
+			 * for this link right now.  Hand back to Tight, which
+			 * libvncserver paces properly, rather than keep the
+			 * screen frozen.
+			 */
+			if (t - stalled_since > 2.0) {
+				rfbLog("h264: client backed up for %.1fs, "
+				    "falling back to Tight\n", t - stalled_since);
+				in_h264_mode = 0;
+				exclusive = 0;
+				stalled_since = 0.0;
+				mark_rect_as_modified(0, 0, screen->width,
+				    screen->height, 1);
+			}
+			return;
+		}
+		stalled_since = 0.0;    /* caught up */
 
 		/* H.264 owns the region for as long as the gate says so */
 		h264_suppress_tight();
@@ -680,6 +820,10 @@ void h264_frame_tick(int tile_diffs) {
 		flags = need_idr ? H264_RESET_CONTEXT : 0;
 		need_idr = 0;
 		h264_broadcast(w, h, au, len, flags, 1);
+		if (h264_last_refused > 0) {
+			/* a refused unit breaks prediction for that client */
+			need_idr = 1;
+		}
 		return;
 	}
 

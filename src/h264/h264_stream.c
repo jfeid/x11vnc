@@ -21,11 +21,34 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* One encoded band, ready to go on the wire. */
+typedef struct {
+	int x, y, w, h;
+	const unsigned char *data;
+	unsigned int len;
+} h264_au_t;
+
 static int h264_fits(rfbClientPtr cl, unsigned int len);
+static rfbBool h264_handle_message(rfbClientPtr cl, void *data,
+    const rfbClientToServerMsg *msg);
 static int h264_last_refused = 0;       /* clients that could not take the last frame */
 
 int h264_force = 0;             /* -h264_force: assume every client wants it */
 char *h264_testfile_path = NULL;
+int h264_fence = 1;             /* fence flow control on unless -h264_nofence */
+int h264_tile_pixels = H264_MAX_TILE_PIXELS;
+/*
+ * Delivery counters.  Added because the first fence validation inferred the
+ * client's frame rate from bytes/s divided by an ASSUMED access-unit size, and
+ * inferred liveness from inbound bytes - both wrong.  TigerVNC's out-stream
+ * flushes once 1 KB accumulates even while corked, so echoes arrive in batches
+ * whether or not its socket loop ever returned to the event pump.  Count the
+ * real events instead of deriving them.  echoes/timeouts are incremented from
+ * the client input thread; a torn read of a stat is harmless.
+ */
+static unsigned long st_frames, st_bytes, st_echoes, st_timeouts, st_held, st_norequest;
+static double st_since = 0.0;
+int h264_fence_timeout_ms = 500;
 static int extension_registered = 0;
 
 /* ------------------------------------------------------------------ *
@@ -35,6 +58,20 @@ static int extension_registered = 0;
 typedef struct {
 	int enabled;                    /* client listed encoding 50 */
 	int preferred;                  /* ...and listed it ahead of everything else */
+	int fence_ok;                   /* client listed pseudo-encoding -312 */
+	/*
+	 * Fence flow control.  outstanding is set by watch_loop when it sends a
+	 * request-fence and cleared by the client's input thread when the echo
+	 * arrives, so it is a hand-off between two threads: volatile keeps the
+	 * gate loop from caching it.  A uint32 read/write is atomic on the
+	 * targets x11vnc runs on, and there is no condition variable to miss -
+	 * watch_loop polls the flag every tick - so no lock is needed for this
+	 * one signal.  seq pairs a fence with its echo so a late echo from a
+	 * previous (timed-out) fence cannot open the gate for the current one.
+	 */
+	volatile int fence_outstanding;
+	uint32_t fence_seq;             /* last request-fence sequence sent */
+	double fence_sent_at;           /* when, for the timeout fallback */
 } h264_client_t;
 
 static rfbBool h264_new_client(rfbClientPtr cl, void **data) {
@@ -63,7 +100,19 @@ static rfbBool h264_enable_pseudo(rfbClientPtr cl, void **data, int encoding) {
 	if (encoding == 0) {
 		st->enabled = 0;
 		st->preferred = 0;
+		st->fence_ok = 0;
 		return FALSE;
+	}
+	if (encoding == RFB_ENCODING_FENCE) {
+		/*
+		 * The client can carry fences (msg 248).  This is what makes
+		 * the flow-control gate safe to arm: without it we would be
+		 * sending an unrecognised message and libvncserver would drop
+		 * the client.  Claim it so we hear about it, then let the H.264
+		 * gate decide when to actually fence.
+		 */
+		st->fence_ok = 1;
+		return TRUE;
 	}
 	if (encoding == RFB_ENCODING_H264) {
 		st->enabled = 1;
@@ -94,14 +143,14 @@ static void h264_close_client(rfbClientPtr cl, void *data) {
 	free(data);
 }
 
-static int h264_pseudo_encodings[] = { RFB_ENCODING_H264, 0 };
+static int h264_pseudo_encodings[] = { RFB_ENCODING_H264, RFB_ENCODING_FENCE, 0 };
 
 static rfbProtocolExtension h264_extension = {
 	h264_new_client,        /* newClient */
 	NULL,                   /* init */
 	h264_pseudo_encodings,  /* pseudoEncodings */
 	h264_enable_pseudo,     /* enablePseudoEncoding */
-	NULL,                   /* handleMessage */
+	h264_handle_message,    /* handleMessage: catches the fence echo (msg 248) */
 	h264_close_client,      /* close */
 	NULL,                   /* usage */
 	NULL,                   /* processArgument */
@@ -215,6 +264,192 @@ int h264_send_rect(rfbClientPtr cl, int x, int y, int w, int h,
 	}
 
 	return ok;
+}
+
+/*
+ * Emit one FramebufferUpdate carrying every tile as its own encoding-50 rect.
+ *
+ * Why several rects rather than one full-screen rect: a rect larger than the
+ * client's decode buffer is silently never displayed (h264_stream.h). Each
+ * tile is a FIXED geometry, so it maps to one stable decoder context - rects
+ * are looked up by exact geometry (isEqualRect) and capped at 64, so a handful
+ * of constant bands is nothing like the churn that made §3 reject
+ * damage-driven rects.
+ *
+ * Same locking contract as h264_send_rect(): the caller holds the send ban.
+ */
+static int h264_send_tiles(rfbClientPtr cl, const h264_au_t *aus, int n,
+    unsigned int flags) {
+	rfbFramebufferUpdateMsg fu;
+	int i;
+
+	if (cl == NULL || n <= 0) {
+		return 0;
+	}
+	{
+		/*
+		 * Check the WHOLE update against the send buffer, not each tile
+		 * separately: they go out back to back with no chance to drain
+		 * in between, so per-tile checks would each pass against a queue
+		 * the previous tile is about to fill.
+		 */
+		unsigned int total = 0;
+		for (i = 0; i < n; i++) {
+			if (aus[i].data == NULL) {
+				return 0;
+			}
+			total += aus[i].len + 20;       /* rect + sub-header */
+		}
+		if (!h264_fits(cl, total)) {
+			return 0;
+		}
+	}
+
+	/* start on a message boundary - anything buffered is a different update */
+	if (cl->ublen > 0 && !rfbSendUpdateBuf(cl)) {
+		return 0;
+	}
+
+	memset(&fu, 0, sizeof(fu));
+	fu.type = rfbFramebufferUpdate;
+	fu.nRects = Swap16IfLE((uint16_t) n);
+	memcpy(&cl->updateBuf[cl->ublen], &fu, sz_rfbFramebufferUpdateMsg);
+	cl->ublen += sz_rfbFramebufferUpdateMsg;
+
+	for (i = 0; i < n; i++) {
+		rfbFramebufferUpdateRectHeader rect;
+		unsigned char sub[8];
+		unsigned int len = aus[i].len;
+
+		rect.r.x = Swap16IfLE(aus[i].x);
+		rect.r.y = Swap16IfLE(aus[i].y);
+		rect.r.w = Swap16IfLE(aus[i].w);
+		rect.r.h = Swap16IfLE(aus[i].h);
+		rect.encoding = Swap32IfLE(RFB_ENCODING_H264);
+		memcpy(&cl->updateBuf[cl->ublen], &rect,
+		    sz_rfbFramebufferUpdateRectHeader);
+		cl->ublen += sz_rfbFramebufferUpdateRectHeader;
+
+		sub[0] = (unsigned char) (len >> 24);
+		sub[1] = (unsigned char) (len >> 16);
+		sub[2] = (unsigned char) (len >> 8);
+		sub[3] = (unsigned char) (len);
+		sub[4] = (unsigned char) (flags >> 24);
+		sub[5] = (unsigned char) (flags >> 16);
+		sub[6] = (unsigned char) (flags >> 8);
+		sub[7] = (unsigned char) (flags);
+		memcpy(&cl->updateBuf[cl->ublen], sub, 8);
+		cl->ublen += 8;
+
+		/* headers out, then the payload straight to the socket */
+		if (!rfbSendUpdateBuf(cl)) {
+			return 0;
+		}
+		if (len > 0 && rfbWriteExact(cl, (const char *) aus[i].data,
+		    (int) len) < 0) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+/* ------------------------------------------------------------------ *
+ * Fence flow control (plan §17)
+ * ------------------------------------------------------------------ */
+
+/*
+ * Emit one RFB fence (message 248).  Same discipline as h264_send_rect: the
+ * caller holds the send ban, so no lock here, and anything libvncserver already
+ * buffered is flushed first so ours starts on a message boundary.  The whole
+ * message is at most 12 + 64 bytes, well under UPDATE_BUF_SIZE.
+ */
+static int h264_send_fence(rfbClientPtr cl, uint32_t flags,
+    const unsigned char *payload, int len) {
+	unsigned char *b;
+
+	if (cl == NULL || len < 0 || len > 64) {
+		return 0;
+	}
+	if (cl->ublen > 0 && !rfbSendUpdateBuf(cl)) {
+		return 0;
+	}
+	b = (unsigned char *) &cl->updateBuf[cl->ublen];
+	b[0] = RFB_MSG_FENCE;
+	b[1] = b[2] = b[3] = 0;                 /* padding */
+	b[4] = (unsigned char) (flags >> 24);
+	b[5] = (unsigned char) (flags >> 16);
+	b[6] = (unsigned char) (flags >> 8);
+	b[7] = (unsigned char) (flags);
+	b[8] = (unsigned char) len;
+	if (len > 0) {
+		memcpy(b + 9, payload, (size_t) len);
+	}
+	cl->ublen += 9 + len;
+	return rfbSendUpdateBuf(cl) ? 1 : 0;
+}
+
+/*
+ * Client -> server message hook.  libvncserver hands us any message type it
+ * does not recognise, having read only the one type byte; we must consume the
+ * rest of the body or the input stream desyncs, and we must return TRUE or the
+ * library closes the client (rfbserver.c, the default case).  This runs on the
+ * client's input thread, not watch_loop.
+ *
+ * A fence with fenceFlagRequest is the peer asking us to echo (a viewer rarely
+ * does this, but be correct); anything else is the echo of a fence we sent, and
+ * clears the gate for that client if the sequence matches.
+ */
+static rfbBool h264_handle_message(rfbClientPtr cl, void *data,
+    const rfbClientToServerMsg *msg) {
+	h264_client_t *st = (h264_client_t *) data;
+	unsigned char hdr[8];
+	unsigned char payload[64];
+	uint32_t flags;
+	int len;
+
+	if (msg->type != RFB_MSG_FENCE) {
+		return FALSE;           /* not ours - let the library handle it */
+	}
+
+	/* body after the type byte: pad[3], flags(u32 be), len(u8), data[len] */
+	if (rfbReadExact(cl, (char *) hdr, 8) <= 0) {
+		return TRUE;            /* connection is gone; we still "handled" it */
+	}
+	flags = ((uint32_t) hdr[3] << 24) | ((uint32_t) hdr[4] << 16) |
+	        ((uint32_t) hdr[5] << 8) | ((uint32_t) hdr[6]);
+	len = hdr[7];
+	if (len > 64) {
+		return TRUE;            /* malformed; drop it rather than desync */
+	}
+	if (len > 0 && rfbReadExact(cl, (char *) payload, len) <= 0) {
+		return TRUE;
+	}
+
+	if (flags & FENCE_FLAG_REQUEST) {
+		/* Peer wants an echo.  Mirror it, minus the request bit, under
+		 * the send ban we do not hold here - but a fence is tiny and
+		 * this path is not the H.264 hot path, so take the client's
+		 * send mutex explicitly, exactly as libvncserver's own writers
+		 * do outside the scan section. */
+		LOCK(cl->sendMutex);
+		h264_send_fence(cl, flags & (FENCE_FLAG_BLOCK_BEFORE |
+		    FENCE_FLAG_BLOCK_AFTER), payload, len);
+		UNLOCK(cl->sendMutex);
+		return TRUE;
+	}
+
+	/* An echo.  Match the sequence so a late echo from a timed-out fence
+	 * cannot open the gate for the current one. */
+	if (st != NULL && len >= 4) {
+		uint32_t seq = ((uint32_t) payload[0] << 24) |
+		    ((uint32_t) payload[1] << 16) |
+		    ((uint32_t) payload[2] << 8) | ((uint32_t) payload[3]);
+		if (seq == st->fence_seq) {
+			st->fence_outstanding = 0;
+			st_echoes++;
+		}
+	}
+	return TRUE;
 }
 
 /* ------------------------------------------------------------------ *
@@ -480,20 +715,115 @@ static void h264_suppress_tight(void) {
 	rfbReleaseClientIterator(iter);
 }
 
-/* Broadcast one access unit to every client that negotiated encoding 50.
- * Called inside watch_loop's send ban, so no locking here - see
- * h264_send_rect(). */
-static int h264_broadcast(int w, int h, const unsigned char *au,
-    unsigned int len, unsigned int flags, int suppress_tight) {
+/*
+ * True while every active client is still waiting to ack the previous frame
+ * (fence outstanding, not yet timed out).  The tick uses this to HOLD before
+ * encoding rather than encode-and-drop: a dropped frame would advance the
+ * encoder past what the client has, so the next send would have to be an IDR,
+ * and under sustained fencing that turns every delivered frame into a ~4x
+ * larger IDR - the opposite of what the pacing is for.  Holding keeps the
+ * stream as clean P-frames, one per ack.  A timed-out fence does not count as
+ * holding, so a lost echo still resolves via the send-anyway path in broadcast.
+ */
+static int h264_fence_holding(double t) {
 	rfbClientIteratorPtr iter;
 	rfbClientPtr cl;
-	int sent = 0, refused = 0;
+	int any_active = 0, all_held = 1;
 
+	if (!h264_fence) {
+		return 0;
+	}
 	iter = rfbGetClientIterator(screen);
 	while ((cl = rfbClientIteratorNext(iter)) != NULL) {
+		h264_client_t *st;
 		if (!h264_client_active(cl)) {
 			continue;
 		}
+		any_active = 1;
+		st = (h264_client_t *) rfbGetExtensionClientData(cl,
+		    &h264_extension);
+		if (st == NULL || !st->fence_ok) {
+			all_held = 0;           /* an un-fenced client can take it */
+			break;
+		}
+		if (!st->fence_outstanding ||
+		    (t - st->fence_sent_at) * 1000.0 >= (double) h264_fence_timeout_ms) {
+			all_held = 0;           /* this one is ready (or timed out) */
+			break;
+		}
+	}
+	rfbReleaseClientIterator(iter);
+	return any_active && all_held;
+}
+
+/*
+ * Clear every client's fence gate.  Called when H.264 hands back to Tight so a
+ * later re-entry starts un-gated instead of waiting out the timeout on a fence
+ * whose echo is no longer coming.
+ */
+static void h264_reset_fences(void) {
+	rfbClientIteratorPtr iter;
+	rfbClientPtr cl;
+
+	iter = rfbGetClientIterator(screen);
+	while ((cl = rfbClientIteratorNext(iter)) != NULL) {
+		h264_client_t *st = (h264_client_t *)
+		    rfbGetExtensionClientData(cl, &h264_extension);
+		if (st != NULL) {
+			st->fence_outstanding = 0;
+		}
+	}
+	rfbReleaseClientIterator(iter);
+}
+
+/* Broadcast one access unit to every client that negotiated encoding 50.
+ * Called inside watch_loop's send ban, so no locking here - see
+ * h264_send_rect(). */
+static int h264_broadcast(const h264_au_t *aus, int ntiles,
+    unsigned int flags, int suppress_tight) {
+	rfbClientIteratorPtr iter;
+	rfbClientPtr cl;
+	int sent = 0, refused = 0, i;
+	unsigned long total = 0;
+
+	for (i = 0; i < ntiles; i++) {
+		total += aus[i].len;
+	}
+
+	iter = rfbGetClientIterator(screen);
+	while ((cl = rfbClientIteratorNext(iter)) != NULL) {
+		h264_client_t *st;
+		int use_fence;
+
+		if (!h264_client_active(cl)) {
+			continue;
+		}
+		st = (h264_client_t *) rfbGetExtensionClientData(cl,
+		    &h264_extension);
+		use_fence = h264_fence && st != NULL && st->fence_ok;
+
+		/*
+		 * Fence gate: do not send another frame until the client has
+		 * echoed the fence that followed the last one.  This is the
+		 * real backpressure the socket queue and the update request
+		 * cannot give us (plan §17): the echo is proof the client's
+		 * single-threaded socket loop drained the previous frame and
+		 * came back for more, so between frames its loop is guaranteed
+		 * to return to the event pump and service input and redraw.
+		 *
+		 * The timeout keeps a lost echo from freezing the stream the
+		 * other way: past it, send anyway and re-arm with a fresh fence.
+		 */
+		if (use_fence && st->fence_outstanding) {
+			double waited = (now_s() - st->fence_sent_at) * 1000.0;
+			if (waited < (double) h264_fence_timeout_ms) {
+				refused++;
+				continue;
+			}
+			st->fence_outstanding = 0;      /* give up on this one */
+			st_timeouts++;
+		}
+
 		/*
 		 * Only send if the client has actually asked for an update.
 		 *
@@ -510,9 +840,10 @@ static int h264_broadcast(int w, int h, const unsigned char *au,
 		 */
 		if (sraRgnEmpty(cl->requestedRegion)) {
 			refused++;
+			st_norequest++;
 			continue;
 		}
-		if (!h264_send_rect(cl, 0, 0, w, h, au, len, flags)) {
+		if (!h264_send_tiles(cl, aus, ntiles, flags)) {
 			/*
 			 * Either the socket could not take the whole unit or
 			 * the write failed.  Do not clear modifiedRegion:
@@ -521,6 +852,26 @@ static int h264_broadcast(int w, int h, const unsigned char *au,
 			 */
 			refused++;
 			continue;
+		}
+		/*
+		 * Chase the frame with a request-fence.  It rides the same
+		 * send ban and the same socket, in order, so the client sees
+		 * [frame][fence] and echoes the fence only after decoding the
+		 * frame.  Arm the gate; the echo (or the timeout) reopens it.
+		 */
+		if (use_fence) {
+			unsigned char seqbuf[4];
+			uint32_t seq = ++st->fence_seq;
+			seqbuf[0] = (unsigned char) (seq >> 24);
+			seqbuf[1] = (unsigned char) (seq >> 16);
+			seqbuf[2] = (unsigned char) (seq >> 8);
+			seqbuf[3] = (unsigned char) (seq);
+			st->fence_sent_at = now_s();
+			st->fence_outstanding = 1;
+			if (!h264_send_fence(cl, FENCE_FLAG_REQUEST, seqbuf, 4)) {
+				/* write failed: do not strand the gate on it */
+				st->fence_outstanding = 0;
+			}
 		}
 		/*
 		 * The H.264 rect just repainted the whole served region, so
@@ -532,11 +883,109 @@ static int h264_broadcast(int w, int h, const unsigned char *au,
 		}
 		/* the request is now satisfied, as libvncserver does after an update */
 		sraRgnMakeEmpty(cl->requestedRegion);
+		st_frames++;
+		st_bytes += total;
 		sent++;
 	}
 	rfbReleaseClientIterator(iter);
 	h264_last_refused = refused;
 	return sent;
+}
+
+/* ------------------------------------------------------------------ *
+ * Tiling (plan §22)
+ * ------------------------------------------------------------------ */
+
+static struct {
+	int y, h;               /* band position in the served region */
+	h264_enc_t *enc;
+} h264_tiles[H264_MAX_TILES];
+static int h264_ntiles = 0;
+static int tiles_w = 0, tiles_h = 0;
+
+static void h264_tiles_close(void) {
+	int i;
+	for (i = 0; i < h264_ntiles; i++) {
+		h264_enc_close(&h264_tiles[i].enc);
+	}
+	h264_ntiles = 0;
+	tiles_w = tiles_h = 0;
+}
+
+static int h264_tiles_open(int w, int h) {
+	int want, band, i, y;
+
+	if (h264_ntiles > 0 && w == tiles_w && h == tiles_h) {
+		return 1;               /* already laid out for this geometry */
+	}
+	h264_tiles_close();
+	if (w <= 0 || h <= 0) {
+		return 0;
+	}
+
+	/*
+	 * As few bands as keep every one inside the client's decode buffer.
+	 * Band height is rounded UP to a multiple of 16 so each tile is a whole
+	 * number of macroblock rows - an odd or unaligned height would need
+	 * cropping in the SPS, and TigerVNC applies frame cropping through
+	 * offset_x/offset_y when it blits, which is a needless place to be
+	 * subtly wrong.  The last band takes the remainder.
+	 */
+	want = 1;
+	if (h264_tile_pixels > 0) {
+		while (want < H264_MAX_TILES &&
+		    (double) w * h / want > (double) h264_tile_pixels) {
+			want++;
+		}
+	}
+	band = ((h + want - 1) / want + 15) / 16 * 16;
+	if (band < 16) {
+		band = 16;
+	}
+
+	y = 0;
+	for (i = 0; i < want && y < h; i++) {
+		int bh = (y + band <= h) ? band : (h - y);
+		if (bh & 1) {
+			bh++;           /* H.264 needs even dimensions */
+		}
+		if (y + bh > h) {
+			bh = h - y;     /* cannot exceed the region */
+		}
+		h264_tiles[i].y = y;
+		h264_tiles[i].h = bh;
+		h264_tiles[i].enc = h264_enc_open(w, bh);
+		if (h264_tiles[i].enc == NULL) {
+			h264_ntiles = i;
+			h264_tiles_close();
+			return 0;
+		}
+		y += bh;
+		h264_ntiles = i + 1;
+	}
+	if (y != h) {
+		rfbLog("h264: tiling %dx%d left %d rows uncovered - refusing\n",
+		    w, h, h - y);
+		h264_tiles_close();
+		return 0;
+	}
+
+	tiles_w = w;
+	tiles_h = h;
+	rfbLog("h264: %d tile(s) of %dx%d for %dx%d "
+	    "(client limit %d px per rect)\n",
+	    h264_ntiles, w, h264_tiles[0].h, w, h, h264_tile_pixels);
+	return 1;
+}
+
+static int h264_tiles_open_any(void) {
+	return h264_ntiles > 0;
+}
+
+void h264_encoders_reset(void) {
+	if (h264_ntiles > 0) {
+		h264_tiles_close();
+	}
 }
 
 /*
@@ -652,6 +1101,7 @@ static void h264_update_gate(int tile_diffs, double t) {
 			 * only updates where fresh damage happens to land.
 			 */
 			exclusive = 0;
+			h264_reset_fences();
 
 			/*
 			 * The client holds a 4:2:0 decode of the whole region.
@@ -695,12 +1145,12 @@ void h264_frame_tick(int tile_diffs) {
 			exclusive = 0;
 			initial_paint_done = 0;
 			stalled_since = 0.0;
-			if (h264_enc_is_open()) {
-				h264_enc_close();
+			if (h264_tiles_open_any()) {
+				h264_tiles_close();
 				need_idr = 1;
 				in_h264_mode = 0;
 				rfbLog("h264: no clients want encoding 50, "
-				    "encoder closed\n");
+				    "encoders closed\n");
 			}
 			return;
 		}
@@ -756,6 +1206,7 @@ void h264_frame_tick(int tile_diffs) {
 				in_h264_mode = 0;
 				exclusive = 0;
 				stalled_since = 0.0;
+				h264_reset_fences();
 				mark_rect_as_modified(0, 0, screen->width,
 				    screen->height, 1);
 			}
@@ -766,10 +1217,43 @@ void h264_frame_tick(int tile_diffs) {
 		/* H.264 owns the region for as long as the gate says so */
 		h264_suppress_tight();
 
+		/*
+		 * Periodic delivery report.  fps here is FRAMES THE CLIENT
+		 * ACKNOWLEDGED, not frames offered: with fences on, echoes
+		 * should track frames one-for-one, and timeouts should be 0.
+		 * A high timeout count means the client is not keeping up and
+		 * the gate is running on the fallback rather than on acks.
+		 */
+		if (st_since == 0.0) {
+			st_since = t;
+		} else if (t - st_since >= 10.0) {
+			double dt2 = t - st_since;
+			rfbLog("h264 stats: %.1f fps sent, %.1f MB/s, "
+			    "%lu echoes, %lu timeouts, %lu held, %lu unrequested\n",
+			    st_frames / dt2, st_bytes / dt2 / 1048576.0,
+			    st_echoes, st_timeouts, st_held, st_norequest);
+			st_frames = st_bytes = st_echoes = 0;
+			st_timeouts = st_held = st_norequest = 0;
+			st_since = t;
+		}
+
 		if (t - last < period) {
 			return;
 		}
-		if (!h264_enc_is_open()) {
+
+		/*
+		 * Fence flow control: if every client still owes an ack for the
+		 * last frame, hold here instead of encoding one they cannot yet
+		 * take.  Holding (rather than encode-and-drop) is what keeps the
+		 * stream as P-frames - see h264_fence_holding().  The encoder is
+		 * not advanced and need_idr is left alone, so the next frame,
+		 * once an ack arrives, predicts cleanly from the last one sent.
+		 */
+		if (h264_fence_holding(t)) {
+			st_held++;
+			return;
+		}
+		if (!h264_tiles_open_any()) {
 			/*
 			 * x11vnc does not poll the screen while no client is
 			 * attached (see bench/README.md), so the framebuffer
@@ -783,7 +1267,7 @@ void h264_frame_tick(int tile_diffs) {
 			copy_screen();
 			need_idr = 1;
 		}
-		if (!h264_enc_open(w, h)) {
+		if (!h264_tiles_open(w, h)) {
 			return;
 		}
 		if (getenv("H264_DUMP_FB")) {
@@ -812,17 +1296,53 @@ void h264_frame_tick(int tile_diffs) {
 				}
 			}
 		}
-		if (!h264_enc_frame((const unsigned char *) screen->frameBuffer,
-		    screen->paddedWidthInBytes, need_idr, &au, &len)) {
-			return;
-		}
-		last = t;
-		flags = need_idr ? H264_RESET_CONTEXT : 0;
-		need_idr = 0;
-		h264_broadcast(w, h, au, len, flags, 1);
-		if (h264_last_refused > 0) {
-			/* a refused unit breaks prediction for that client */
-			need_idr = 1;
+		{
+			h264_au_t tiles[H264_MAX_TILES];
+			const unsigned char *fb =
+			    (const unsigned char *) screen->frameBuffer;
+			int stride = screen->paddedWidthInBytes;
+			int i, ok = 1;
+
+			/*
+			 * Encode each band from the framebuffer in place: rows
+			 * are contiguous, so a horizontal band is just an
+			 * offset pointer with the same stride.  That keeps the
+			 * zero-copy property of the single-rect path - no
+			 * allocation, no copy, and it is why the region is
+			 * split into bands rather than columns.
+			 */
+			for (i = 0; i < h264_ntiles; i++) {
+				const unsigned char *p = fb +
+				    (size_t) h264_tiles[i].y * stride;
+				if (!h264_enc_frame(h264_tiles[i].enc, p,
+				    stride, need_idr, &tiles[i].data,
+				    &tiles[i].len)) {
+					ok = 0;
+					break;
+				}
+				tiles[i].x = 0;
+				tiles[i].y = h264_tiles[i].y;
+				tiles[i].w = w;
+				tiles[i].h = h264_tiles[i].h;
+			}
+			if (!ok) {
+				/*
+				 * A partial frame cannot be sent: the tiles
+				 * that did encode have advanced their
+				 * reference chains past what the client holds,
+				 * so the next frame must re-key everything.
+				 */
+				need_idr = 1;
+				return;
+			}
+			last = t;
+			flags = need_idr ? H264_RESET_CONTEXT : 0;
+			need_idr = 0;
+			h264_broadcast(tiles, h264_ntiles, flags, 1);
+			if (h264_last_refused > 0) {
+				/* a refused unit breaks prediction */
+				need_idr = 1;
+			}
 		}
 		return;
 	}
@@ -832,6 +1352,12 @@ void h264_frame_tick(int tile_diffs) {
 	}
 	au = h264_testfile_next(&len, &flags);
 	if (au != NULL) {
-		h264_broadcast((int) tf_w, (int) tf_h, au, len, flags, 0);
+		h264_au_t one;
+		one.x = one.y = 0;
+		one.w = (int) tf_w;
+		one.h = (int) tf_h;
+		one.data = au;
+		one.len = len;
+		h264_broadcast(&one, 1, flags, 0);
 	}
 }

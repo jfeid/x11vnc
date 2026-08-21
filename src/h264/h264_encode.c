@@ -26,57 +26,63 @@ int h264_fps = 30;
 #include <libavutil/opt.h>
 #include <libavutil/imgutils.h>
 
-static AVCodecContext *ctx = NULL;
-static AVFrame *frame = NULL;
-static AVPacket *pkt = NULL;
-static int enc_w = 0, enc_h = 0;
-static int64_t pts = 0;
+struct h264_enc {
+	AVCodecContext *ctx;
+	AVFrame *frame;
+	AVPacket *pkt;
+	int w, h;
+	int64_t pts;
+	/* extradata (SPS+PPS) + packet payload, rebuilt per frame */
+	unsigned char *au_buf;
+	unsigned int au_cap;
+};
 
-/* extradata (SPS+PPS) + packet payload, rebuilt per frame */
-static unsigned char *au_buf = NULL;
-static unsigned int au_cap = 0;
+void h264_enc_close(h264_enc_t **ep) {
+	h264_enc_t *e;
 
-int h264_enc_is_open(void) {
-	return ctx != NULL;
+	if (ep == NULL || *ep == NULL) {
+		return;
+	}
+	e = *ep;
+	if (e->frame) { av_frame_free(&e->frame); }
+	if (e->pkt)   { av_packet_free(&e->pkt); }
+	if (e->ctx)   { avcodec_free_context(&e->ctx); }
+	free(e->au_buf);
+	free(e);
+	*ep = NULL;
 }
 
-void h264_enc_close(void) {
-	if (frame) { av_frame_free(&frame); }
-	if (pkt)   { av_packet_free(&pkt); }
-	if (ctx)   { avcodec_free_context(&ctx); }
-	free(au_buf); au_buf = NULL; au_cap = 0;
-	enc_w = enc_h = 0;
-	pts = 0;
-}
-
-int h264_enc_open(int w, int h) {
+h264_enc_t *h264_enc_open(int w, int h) {
 	const AVCodec *codec;
+	h264_enc_t *e;
+	AVCodecContext *ctx;
 	int rc;
 	double t_open;
 
-	if (ctx != NULL && w == enc_w && h == enc_h) {
-		return 1;
-	}
-	h264_enc_close();
-
 	if (w <= 0 || h <= 0) {
-		return 0;
+		return NULL;
 	}
 	/* H.264 needs even dimensions */
 	if ((w & 1) || (h & 1)) {
 		rfbLog("h264: %dx%d is not even, cannot encode\n", w, h);
-		return 0;
+		return NULL;
 	}
 
 	codec = avcodec_find_encoder_by_name("h264_nvenc");
 	if (codec == NULL) {
 		rfbLog("h264: h264_nvenc not available in this libavcodec\n");
-		return 0;
+		return NULL;
+	}
+	e = (h264_enc_t *) calloc(1, sizeof(*e));
+	if (e == NULL) {
+		return NULL;
 	}
 	ctx = avcodec_alloc_context3(codec);
 	if (ctx == NULL) {
-		return 0;
+		free(e);
+		return NULL;
 	}
+	e->ctx = ctx;
 
 	ctx->width = w;
 	ctx->height = h;
@@ -98,7 +104,14 @@ int h264_enc_open(int w, int h) {
 
 	/* No B-frames: any reordering is latency we cannot spend (plan §5). */
 	ctx->max_b_frames = 0;
-	ctx->gop_size = (h264_fps > 0 ? h264_fps : 30) * 10;
+	/*
+	 * 2 s of GOP, not 10.  The IDR interval is the worst case for how long
+	 * the client can show nothing if it ever fails to start on our keyframe
+	 * - it recovers only at the next IDR.  Ten seconds of frozen desktop is
+	 * indistinguishable from a hang; two is a blink.  Cheap insurance now
+	 * that forced-idr makes the deliberate keyframes real IDRs anyway.
+	 */
+	ctx->gop_size = (h264_fps > 0 ? h264_fps : 30) * 2;
 
 	/*
 	 * Parameter sets into extradata rather than only on keyframes, so
@@ -108,7 +121,31 @@ int h264_enc_open(int w, int h) {
 
 	av_opt_set(ctx->priv_data, "preset", "p4", 0);
 	av_opt_set(ctx->priv_data, "tune", "ll", 0);
-	av_opt_set(ctx->priv_data, "rc", "cbr", 0);
+	/*
+	 * VBR, not CBR.  Strict CBR makes NVENC pad every frame with filler
+	 * NALs to hit the bitrate exactly whatever the content: measured on the
+	 * wire, access units were a constant 500,051 bytes of which 96%, 39%
+	 * and 50% was filler on three consecutive frames.  That is bandwidth
+	 * spent transmitting padding, on a link this project exists to fit
+	 * inside.  VBR with the same cap keeps the ceiling and lets a static or
+	 * cheap frame actually be small.
+	 */
+	av_opt_set(ctx->priv_data, "rc", "vbr", 0);
+	/*
+	 * MANDATORY, and the cause of a silent freeze without it.  We ask for a
+	 * keyframe by setting pict_type = AV_PICTURE_TYPE_I, but h264_nvenc
+	 * defaults forced-idr to false, so that request produces a plain I
+	 * slice rather than an IDR - confirmed on the wire: the very access
+	 * unit carrying H264_RESET_CONTEXT decoded as SPS+PPS+I-slice(NON-IDR).
+	 *
+	 * The client destroys its decoder context on that flag and builds a new
+	 * one, and a fresh H.264 decoder cannot start on a non-IDR picture.
+	 * TigerVNC's Media Foundation path then gets NEED_MORE_INPUT forever,
+	 * never sets `decoded`, and never calls pb->imageRect() - so the viewer
+	 * silently paints nothing until the next GOP boundary, with no error
+	 * anywhere (plan §1: encoding 50 has no diagnostics).
+	 */
+	av_opt_set(ctx->priv_data, "forced-idr", "1", 0);
 	av_opt_set(ctx->priv_data, "zerolatency", "1", 0);
 	av_opt_set(ctx->priv_data, "delay", "0", 0);
 
@@ -117,15 +154,15 @@ int h264_enc_open(int w, int h) {
 	t_open = enc_now() - t_open;
 	if (rc < 0) {
 		rfbLog("h264: avcodec_open2 failed (%d)\n", rc);
-		avcodec_free_context(&ctx);
-		return 0;
+		h264_enc_close(&e);
+		return NULL;
 	}
 
-	frame = av_frame_alloc();
-	pkt = av_packet_alloc();
-	if (frame == NULL || pkt == NULL) {
-		h264_enc_close();
-		return 0;
+	e->frame = av_frame_alloc();
+	e->pkt = av_packet_alloc();
+	if (e->frame == NULL || e->pkt == NULL) {
+		h264_enc_close(&e);
+		return NULL;
 	}
 	/*
 	 * No av_frame_get_buffer(): the frame points straight at x11vnc's
@@ -133,80 +170,81 @@ int h264_enc_open(int w, int h) {
 	 * side.  Safe because h264_frame_tick() runs inside watch_loop's send
 	 * ban, after scan_for_updates() has finished writing the framebuffer.
 	 */
-	frame->format = AV_PIX_FMT_BGR0;
-	frame->width = w;
-	frame->height = h;
+	e->frame->format = AV_PIX_FMT_BGR0;
+	e->frame->width = w;
+	e->frame->height = h;
 
-	enc_w = w;
-	enc_h = h;
-	pts = 0;
+	e->w = w;
+	e->h = h;
+	e->pts = 0;
 	rfbLog("h264: encoder open, %dx%d @%dfps, %d kbps, extradata %d bytes, "
 	    "avcodec_open2 took %.0f ms\n", w, h, ctx->framerate.num,
 	    h264_bitrate_kbps, ctx->extradata_size, t_open * 1000.0);
-	return 1;
+	return e;
 }
 
-int h264_enc_frame(const unsigned char *bgra, int stride, int force_idr,
-    const unsigned char **au, unsigned int *len) {
+int h264_enc_frame(h264_enc_t *e, const unsigned char *bgra, int stride,
+    int force_idr, const unsigned char **au, unsigned int *len) {
 	unsigned int need;
 	int rc;
 
-	if (ctx == NULL || bgra == NULL) {
+	if (e == NULL || e->ctx == NULL || bgra == NULL) {
 		return 0;
 	}
 
-	frame->data[0] = (uint8_t *) bgra;
-	frame->linesize[0] = stride;
-	frame->data[1] = frame->data[2] = frame->data[3] = NULL;
-	frame->linesize[1] = frame->linesize[2] = frame->linesize[3] = 0;
-	frame->pts = pts++;
+	e->frame->data[0] = (uint8_t *) bgra;
+	e->frame->linesize[0] = stride;
+	e->frame->data[1] = e->frame->data[2] = e->frame->data[3] = NULL;
+	e->frame->linesize[1] = e->frame->linesize[2] = e->frame->linesize[3] = 0;
+	e->frame->pts = e->pts++;
 	if (force_idr) {
-		frame->pict_type = AV_PICTURE_TYPE_I;
-		frame->flags |= AV_FRAME_FLAG_KEY;
+		e->frame->pict_type = AV_PICTURE_TYPE_I;
+		e->frame->flags |= AV_FRAME_FLAG_KEY;
 	} else {
-		frame->pict_type = AV_PICTURE_TYPE_NONE;
-		frame->flags &= ~AV_FRAME_FLAG_KEY;
+		e->frame->pict_type = AV_PICTURE_TYPE_NONE;
+		e->frame->flags &= ~AV_FRAME_FLAG_KEY;
 	}
 
-	if (avcodec_send_frame(ctx, frame) < 0) {
+	if (avcodec_send_frame(e->ctx, e->frame) < 0) {
 		return 0;
 	}
-	rc = avcodec_receive_packet(ctx, pkt);
+	rc = avcodec_receive_packet(e->ctx, e->pkt);
 	if (rc < 0) {
 		return 0;               /* EAGAIN: nothing ready yet */
 	}
 
 	/* SPS+PPS in front of every access unit - see the header comment. */
-	need = (unsigned int) ctx->extradata_size + (unsigned int) pkt->size;
-	if (need > au_cap) {
-		unsigned char *nb = (unsigned char *) realloc(au_buf, need);
+	need = (unsigned int) e->ctx->extradata_size + (unsigned int) e->pkt->size;
+	if (need > e->au_cap) {
+		unsigned char *nb = (unsigned char *) realloc(e->au_buf, need);
 		if (nb == NULL) {
-			av_packet_unref(pkt);
+			av_packet_unref(e->pkt);
 			return 0;
 		}
-		au_buf = nb;
-		au_cap = need;
+		e->au_buf = nb;
+		e->au_cap = need;
 	}
-	memcpy(au_buf, ctx->extradata, (size_t) ctx->extradata_size);
-	memcpy(au_buf + ctx->extradata_size, pkt->data, (size_t) pkt->size);
-	*au = au_buf;
+	memcpy(e->au_buf, e->ctx->extradata, (size_t) e->ctx->extradata_size);
+	memcpy(e->au_buf + e->ctx->extradata_size, e->pkt->data,
+	    (size_t) e->pkt->size);
+	*au = e->au_buf;
 	*len = need;
-	av_packet_unref(pkt);
+	av_packet_unref(e->pkt);
 	return 1;
 }
 
 #else  /* !HAVE_FFMPEG */
 
-int h264_enc_is_open(void) { return 0; }
-void h264_enc_close(void) { }
-int h264_enc_open(int w, int h) {
+void h264_enc_close(h264_enc_t **ep) { (void) ep; }
+h264_enc_t *h264_enc_open(int w, int h) {
 	(void) w; (void) h;
 	rfbLog("h264: built without ffmpeg; -h264 unavailable\n");
-	return 0;
+	return NULL;
 }
-int h264_enc_frame(const unsigned char *bgra, int stride, int force_idr,
-    const unsigned char **au, unsigned int *len) {
-	(void) bgra; (void) stride; (void) force_idr; (void) au; (void) len;
+int h264_enc_frame(h264_enc_t *e, const unsigned char *bgra, int stride,
+    int force_idr, const unsigned char **au, unsigned int *len) {
+	(void) e; (void) bgra; (void) stride; (void) force_idr;
+	(void) au; (void) len;
 	return 0;
 }
 

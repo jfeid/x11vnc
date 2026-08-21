@@ -5139,6 +5139,40 @@ char *process_remote_cmd(char *cmd, int stringonly) {
 		goto done;
 	}
 	/*
+	 * Fence flow control.  Tested before "h264_fence" so the longer name
+	 * wins - COLON_CHECK keys on the exact "name:" prefix.  Read every tick,
+	 * so both apply immediately without dropping the encoder.
+	 */
+	if (strstr(p, "h264_fence_timeout") == p) {
+		int d;
+		COLON_CHECK("h264_fence_timeout:")
+		if (query) {
+			snprintf(buf, bufn, "ans=%s%s%d", p, co,
+			    h264_fence_timeout_ms);
+			goto qry;
+		}
+		p += strlen("h264_fence_timeout:");
+		d = atoi(p);
+		if (d < 1) d = 1;
+		rfbLog("remote_cmd: H.264 fence timeout %d ms.\n", d);
+		h264_fence_timeout_ms = d;
+		goto done;
+	}
+	if (strstr(p, "h264_fence") == p) {
+		int d;
+		COLON_CHECK("h264_fence:")
+		if (query) {
+			snprintf(buf, bufn, "ans=%s%s%d", p, co, h264_fence);
+			goto qry;
+		}
+		p += strlen("h264_fence:");
+		d = atoi(p) ? 1 : 0;
+		rfbLog("remote_cmd: H.264 fence flow control %s.\n",
+		    d ? "on" : "off");
+		h264_fence = d;
+		goto done;
+	}
+	/*
 	 * Bitrate and frame rate are fixed when the encoder is opened, so drop
 	 * the encoder; the next tick that needs it reopens with the new value.
 	 */
@@ -5154,7 +5188,7 @@ char *process_remote_cmd(char *cmd, int stringonly) {
 		if (d < 100) d = 100;
 		rfbLog("remote_cmd: H.264 bitrate %d kbps.\n", d);
 		h264_bitrate_kbps = d;
-		h264_enc_close();
+		h264_encoders_reset();
 		goto done;
 	}
 	if (strstr(p, "h264_fps") == p) {
@@ -5170,7 +5204,7 @@ char *process_remote_cmd(char *cmd, int stringonly) {
 		if (d > 120) d = 120;
 		rfbLog("remote_cmd: H.264 frame rate %d fps.\n", d);
 		h264_fps = d;
-		h264_enc_close();
+		h264_encoders_reset();
 		goto done;
 	}
 

@@ -13,11 +13,18 @@ extern int h264_enable;                 /* -h264: encode live instead of a test 
 extern int h264_bitrate_kbps;           /* -h264_bitrate */
 extern int h264_fps;                    /* -h264_fps */
 
-/* Open/close the encoder for a given served size.  Reopening with the same
- * geometry is a no-op. */
-extern int h264_enc_open(int w, int h);
-extern void h264_enc_close(void);
-extern int h264_enc_is_open(void);
+/*
+ * One encoder per tile.  The served region is split into horizontal bands
+ * because a single full-screen rect is undecodable on the real client - see
+ * h264_stream.h and the plan, §22 - and each band carries its own independent
+ * H.264 stream, its own reference chain and its own IDRs.
+ */
+typedef struct h264_enc h264_enc_t;
+
+/* Open an encoder for one tile.  Returns NULL on failure. */
+extern h264_enc_t *h264_enc_open(int w, int h);
+/* Close and NULL the handle.  Safe on an already-NULL handle. */
+extern void h264_enc_close(h264_enc_t **ep);
 
 /*
  * Encode one BGRA frame.  Returns 1 and points *au at an Annex-B access unit
@@ -29,7 +36,7 @@ extern int h264_enc_is_open(void);
  * prepended here, rather than appearing only on keyframes.  TigerVNC's Windows
  * decoder requires SPS-first on every buffer - see the plan, §1.
  */
-extern int h264_enc_frame(const unsigned char *bgra, int stride, int force_idr,
-    const unsigned char **au, unsigned int *len);
+extern int h264_enc_frame(h264_enc_t *e, const unsigned char *bgra, int stride,
+    int force_idr, const unsigned char **au, unsigned int *len);
 
 #endif

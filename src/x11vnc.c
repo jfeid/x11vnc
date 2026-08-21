@@ -3956,6 +3956,20 @@ int main(int argc, char* argv[]) {
 			h264_force = 1;
 			continue;
 		}
+		if (!strcmp(arg, "-h264_tile_pixels")) {
+			CHECK_ARGC
+			h264_tile_pixels = atoi(argv[++i]);
+			continue;
+		}
+		if (!strcmp(arg, "-h264_nofence")) {
+			h264_fence = 0;
+			continue;
+		}
+		if (!strcmp(arg, "-h264_fence_timeout")) {
+			CHECK_ARGC
+			h264_fence_timeout_ms = atoi(argv[++i]);
+			continue;
+		}
 		if (!strcmp(arg, "-h264_testfile")) {
 			CHECK_ARGC
 			h264_testfile_path = strdup(argv[++i]);

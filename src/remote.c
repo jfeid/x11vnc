@@ -33,6 +33,8 @@ so, delete this exception statement from your version.
 /* -- remote.c -- */
 
 #include "x11vnc.h"
+#include "h264/h264_stream.h"
+#include "h264/h264_encode.h"
 #include "inet.h"
 #include "xwrappers.h"
 #include "xevents.h"
@@ -5094,6 +5096,84 @@ char *process_remote_cmd(char *cmd, int stringonly) {
 
 		goto done;
 	}
+	/*
+	 * H.264 hybrid tuning.  The two thresholds are read on every
+	 * watch_loop tick, so they take effect immediately - which is the
+	 * point: finding the right crossover means trying values against real
+	 * scrolling, and restarting the service to do that drops the session
+	 * you are judging with.
+	 *
+	 * Rate is in screens of dirty area per second; stored as hundredths so
+	 * the option stays integer like the rest of the remote interface.
+	 */
+	if (strstr(p, "h264_enter") == p) {
+		int d;
+		COLON_CHECK("h264_enter:")
+		if (query) {
+			snprintf(buf, bufn, "ans=%s%s%.2f", p, co,
+			    h264_enter_rate / 100.0);
+			goto qry;
+		}
+		p += strlen("h264_enter:");
+		d = (int) (atof(p) * 100);
+		if (d < 1) d = 1;
+		rfbLog("remote_cmd: H.264 enter threshold %.2f screens/s.\n",
+		    d / 100.0);
+		h264_enter_rate = d;
+		goto done;
+	}
+	if (strstr(p, "h264_exit") == p) {
+		int d;
+		COLON_CHECK("h264_exit:")
+		if (query) {
+			snprintf(buf, bufn, "ans=%s%s%.2f", p, co,
+			    h264_exit_rate / 100.0);
+			goto qry;
+		}
+		p += strlen("h264_exit:");
+		d = (int) (atof(p) * 100);
+		if (d < 0) d = 0;
+		rfbLog("remote_cmd: H.264 exit threshold %.2f screens/s.\n",
+		    d / 100.0);
+		h264_exit_rate = d;
+		goto done;
+	}
+	/*
+	 * Bitrate and frame rate are fixed when the encoder is opened, so drop
+	 * the encoder; the next tick that needs it reopens with the new value.
+	 */
+	if (strstr(p, "h264_bitrate") == p) {
+		int d;
+		COLON_CHECK("h264_bitrate:")
+		if (query) {
+			snprintf(buf, bufn, "ans=%s%s%d", p, co, h264_bitrate_kbps);
+			goto qry;
+		}
+		p += strlen("h264_bitrate:");
+		d = atoi(p);
+		if (d < 100) d = 100;
+		rfbLog("remote_cmd: H.264 bitrate %d kbps.\n", d);
+		h264_bitrate_kbps = d;
+		h264_enc_close();
+		goto done;
+	}
+	if (strstr(p, "h264_fps") == p) {
+		int d;
+		COLON_CHECK("h264_fps:")
+		if (query) {
+			snprintf(buf, bufn, "ans=%s%s%d", p, co, h264_fps);
+			goto qry;
+		}
+		p += strlen("h264_fps:");
+		d = atoi(p);
+		if (d < 1) d = 1;
+		if (d > 120) d = 120;
+		rfbLog("remote_cmd: H.264 frame rate %d fps.\n", d);
+		h264_fps = d;
+		h264_enc_close();
+		goto done;
+	}
+
 #if HAVE_NVFBC
 	/*
 	 * NVFBC tuning.  Every one of these is fixed at capture-session

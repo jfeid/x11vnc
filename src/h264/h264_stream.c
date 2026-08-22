@@ -11,6 +11,7 @@
 #include "x11vnc.h"
 #include "cleanup.h"
 #include "scan.h"
+#include "xwrappers.h"
 #include "h264/h264_stream.h"
 #include "h264/h264_encode.h"
 #include <sys/time.h>
@@ -47,6 +48,11 @@ int h264_tile_pixels = H264_MAX_TILE_PIXELS;
  * the client input thread; a torn read of a stat is harmless.
  */
 static unsigned long st_frames, st_bytes, st_echoes, st_timeouts, st_held, st_norequest;
+/* frames encoded straight out of NVFBC's capture buffer rather than main_fb */
+static unsigned long st_direct;
+/* scan cycles that skipped filling main_fb (plan §24) - compare against the
+ * grabs/sec in the NVFBC stats line: materially fewer means a copy survives */
+static unsigned long st_skips;
 static double st_since = 0.0;
 int h264_fence_timeout_ms = 500;
 static int extension_registered = 0;
@@ -1012,6 +1018,111 @@ static double stalled_since = 0.0;      /* when the client first fell behind */
 int h264_owns_output(void) {
 	return exclusive;
 }
+
+/*
+ * ------------------------------------------------------------------
+ * Where the pixels come from (plan §24, "Phase 3'")
+ * ------------------------------------------------------------------
+ *
+ * While H.264 owns every client, nothing reads main_fb: libvncserver is told
+ * about no damage at all, so the only consumer of those pixels is this
+ * encoder.  Filling it costs two copies per dirty tile - NVFBC's buffer into
+ * an XImage, then that XImage into main_fb - which at 2560x1440 is 2 x 14.7 MB
+ * per captured frame, measured as the bulk of the residual CPU.  So scan.c
+ * skips them and the encoder reads NVFBC's buffer where it already is.
+ *
+ * The price is that main_fb goes stale for as long as this holds.  Every path
+ * out of H.264 mode therefore goes through h264_release_output(), which
+ * refills it before Tight is asked to repaint - otherwise Tight faithfully
+ * repaints the image from the moment the gate engaged.
+ */
+static int fb_stale = 0;        /* main_fb has not been refilled since the skip */
+
+/*
+ * NVFBC's capture buffer, but only when it can stand in for main_fb exactly:
+ * same geometry, and no scaling or colour transformation in between.  NULL
+ * otherwise, and then everything falls back to the framebuffer.
+ */
+static const unsigned char *h264_nvfbc_pixels(int *stride) {
+#if HAVE_NVFBC
+	if (screen == NULL || rfb_fb != main_fb ||
+	    screen->width != dpy_x || screen->height != dpy_y) {
+		return NULL;
+	}
+	return (const unsigned char *) nvfbc_served_pixels(stride);
+#else
+	(void) stride;
+	return NULL;
+#endif
+}
+
+/*
+ * Asked by scan.c once per cycle, before it would do the copies.
+ * h264_fb_copy_skipped() records that it acted on the answer, which is what
+ * tells the exit path main_fb needs refilling.
+ */
+int h264_fb_copy_skippable(void) {
+	int stride = 0;
+
+	return h264_enable && exclusive &&
+	    h264_nvfbc_pixels(&stride) != NULL;
+}
+
+void h264_fb_copy_skipped(void) {
+	fb_stale = 1;
+	st_skips++;
+}
+
+/*
+ * This tick's source.
+ *
+ * scan.c decided whether to skip the copies earlier in the same watch_loop
+ * iteration; in principle the two decisions can disagree (a grab that fails in
+ * between, say), so falling back to the framebuffer has to repair it first.
+ *
+ * LIFETIME: NVFBC's buffer is overwritten by the next grab, which happens at
+ * the top of the next scan_for_updates().  This runs after this cycle's grab
+ * and inside watch_loop's send ban, so the frame is ours for the duration.
+ */
+static const unsigned char *h264_frame_source(int *stride) {
+	int s = 0;
+	const unsigned char *p = h264_nvfbc_pixels(&s);
+
+	if (p != NULL) {
+		*stride = s;
+		st_direct++;
+		return p;
+	}
+	if (fb_stale) {
+		fb_stale = 0;
+		copy_screen();
+	}
+	*stride = screen->paddedWidthInBytes;
+	return (const unsigned char *) screen->frameBuffer;
+}
+
+/*
+ * Hand the output back to Tight.
+ *
+ * Order matters twice over.  `exclusive` has to drop first, because
+ * mark_rect_as_modified() is suppressed while H.264 owns the output and would
+ * otherwise swallow the very repaint being asked for here (§13's bug).  And
+ * main_fb has to be refilled before the mark, because Tight will repaint
+ * exactly what is in it - which, after a period of skipped copies, is the
+ * screen as it was when the gate engaged.
+ *
+ * Idempotent: fb_stale is what limits the refill to once per H.264 period.
+ */
+static void h264_release_output(void) {
+	exclusive = 0;
+	h264_reset_fences();
+	if (fb_stale) {
+		fb_stale = 0;
+		copy_screen();
+	}
+	mark_rect_as_modified(0, 0, screen->width, screen->height, 1);
+}
+
 static double dirty_ewma = 0.0;
 static double last_tick = 0.0;
 
@@ -1093,22 +1204,14 @@ static void h264_update_gate(int tile_diffs, double t) {
 			below_since = 0.0;
 			rfbLog("h264: quiet %.2f screens/s -> Tight\n", dirty_ewma);
 			/*
-			 * Drop the claim on the output BEFORE asking for the
-			 * repaint.  exclusive is only recomputed after this
-			 * function returns, so leaving it set means the guard
-			 * in scan.c swallows the very mark we are making here -
-			 * the screen then freezes on the last H.264 frame and
-			 * only updates where fresh damage happens to land.
+			 * The client holds a 4:2:0 decode of the whole region;
+			 * repaint it with Tight so settled text is crisp again.
+			 * h264_release_output() drops the claim first (the
+			 * guard in scan.c would otherwise swallow this very
+			 * mark) and refills main_fb first (the copies have been
+			 * skipped for the whole H.264 period).
 			 */
-			exclusive = 0;
-			h264_reset_fences();
-
-			/*
-			 * The client holds a 4:2:0 decode of the whole region.
-			 * Repaint it with Tight so settled text is crisp again.
-			 */
-			mark_rect_as_modified(0, 0, screen->width,
-			    screen->height, 1);
+			h264_release_output();
 		}
 	}
 }
@@ -1142,9 +1245,16 @@ void h264_frame_tick(int tile_diffs) {
 		 */
 		if (h264_active_clients() == 0) {
 			clients_since = 0.0;
-			exclusive = 0;
 			initial_paint_done = 0;
 			stalled_since = 0.0;
+			/*
+			 * The last H.264 client leaving is an exit like any
+			 * other: main_fb is stale, and the next viewer to
+			 * connect would be served that stale image by Tight.
+			 */
+			if (exclusive || fb_stale) {
+				h264_release_output();
+			}
 			if (h264_tiles_open_any()) {
 				h264_tiles_close();
 				need_idr = 1;
@@ -1166,12 +1276,21 @@ void h264_frame_tick(int tile_diffs) {
 		 * sharing the session would otherwise see a frozen screen.
 		 */
 		{
-			int total = 0;
+			int total = 0, was = exclusive;
 			rfbClientIteratorPtr it = rfbGetClientIterator(screen);
 			while (rfbClientIteratorNext(it) != NULL) total++;
 			rfbReleaseClientIterator(it);
 			exclusive = in_h264_mode && total > 0 &&
 			    h264_active_clients() == total;
+			/*
+			 * The claim can also drop without the gate exiting - a
+			 * second, Tight-only viewer joining the session is
+			 * enough.  That viewer would be served a main_fb the
+			 * scan stopped filling, so treat it as an exit too.
+			 */
+			if (was && !exclusive) {
+				h264_release_output();
+			}
 		}
 
 		if (!in_h264_mode) {
@@ -1204,11 +1323,8 @@ void h264_frame_tick(int tile_diffs) {
 				rfbLog("h264: client backed up for %.1fs, "
 				    "falling back to Tight\n", t - stalled_since);
 				in_h264_mode = 0;
-				exclusive = 0;
 				stalled_since = 0.0;
-				h264_reset_fences();
-				mark_rect_as_modified(0, 0, screen->width,
-				    screen->height, 1);
+				h264_release_output();
 			}
 			return;
 		}
@@ -1229,11 +1345,14 @@ void h264_frame_tick(int tile_diffs) {
 		} else if (t - st_since >= 10.0) {
 			double dt2 = t - st_since;
 			rfbLog("h264 stats: %.1f fps sent, %.1f MB/s, "
-			    "%lu echoes, %lu timeouts, %lu held, %lu unrequested\n",
+			    "%lu echoes, %lu timeouts, %lu held, %lu unrequested, "
+			    "%lu direct, %.0f fb-skips/s\n",
 			    st_frames / dt2, st_bytes / dt2 / 1048576.0,
-			    st_echoes, st_timeouts, st_held, st_norequest);
+			    st_echoes, st_timeouts, st_held, st_norequest,
+			    st_direct, st_skips / dt2);
 			st_frames = st_bytes = st_echoes = 0;
-			st_timeouts = st_held = st_norequest = 0;
+			st_timeouts = st_held = st_norequest = st_direct = 0;
+			st_skips = 0;
 			st_since = t;
 		}
 
@@ -1265,25 +1384,40 @@ void h264_frame_tick(int tile_diffs) {
 			 * happens to land. Force a full copy first.
 			 */
 			copy_screen();
+			fb_stale = 0;   /* just refilled */
 			need_idr = 1;
 		}
 		if (!h264_tiles_open(w, h)) {
 			return;
 		}
 		if (getenv("H264_DUMP_FB")) {
-			/* one-shot: what does the encoder actually see? */
+			/*
+			 * One-shot: what does the encoder actually see?  It
+			 * has to read whichever source the encode below will,
+			 * or it answers a question nobody asked - this is the
+			 * probe that settles cursor and geometry arguments.
+			 * Read-only, so no st_direct and no copy_screen().
+			 */
 			static int dumped = 0;
 			if (!dumped) {
 				FILE *f = fopen("/tmp/h264-fb.ppm", "wb");
 				dumped = 1;
 				if (f) {
+					int dstride = 0;
 					const unsigned char *fb =
-					    (const unsigned char *) screen->frameBuffer;
+					    h264_nvfbc_pixels(&dstride);
+					const char *what = "nvfbc";
 					int x, y;
+					if (fb == NULL) {
+						fb = (const unsigned char *)
+						    screen->frameBuffer;
+						dstride = screen->paddedWidthInBytes;
+						what = "main_fb";
+					}
 					fprintf(f, "P6\n%d %d\n255\n", w, h);
 					for (y = 0; y < h; y++) {
 						const unsigned char *row = fb +
-						    (size_t) y * screen->paddedWidthInBytes;
+						    (size_t) y * dstride;
 						for (x = 0; x < w; x++) {
 							fputc(row[x*4+2], f);
 							fputc(row[x*4+1], f);
@@ -1291,26 +1425,31 @@ void h264_frame_tick(int tile_diffs) {
 						}
 					}
 					fclose(f);
-					rfbLog("h264: dumped first encoded frame to "
-					    "/tmp/h264-fb.ppm\n");
+					rfbLog("h264: dumped first encoded frame "
+					    "(from %s) to /tmp/h264-fb.ppm\n", what);
 				}
 			}
 		}
 		{
 			h264_au_t tiles[H264_MAX_TILES];
-			const unsigned char *fb =
-			    (const unsigned char *) screen->frameBuffer;
-			int stride = screen->paddedWidthInBytes;
+			const unsigned char *fb;
+			int stride;
 			int i, ok = 1;
 
 			/*
-			 * Encode each band from the framebuffer in place: rows
-			 * are contiguous, so a horizontal band is just an
-			 * offset pointer with the same stride.  That keeps the
+			 * Encode each band from the source in place: rows are
+			 * contiguous, so a horizontal band is just an offset
+			 * pointer with the same stride.  That keeps the
 			 * zero-copy property of the single-rect path - no
 			 * allocation, no copy, and it is why the region is
 			 * split into bands rather than columns.
+			 *
+			 * The source is NVFBC's capture buffer whenever it is
+			 * usable, and main_fb otherwise; the band layout is
+			 * identical either way because the fork already
+			 * captures exactly the served region.
 			 */
+			fb = h264_frame_source(&stride);
 			for (i = 0; i < h264_ntiles; i++) {
 				const unsigned char *p = fb +
 				    (size_t) h264_tiles[i].y * stride;

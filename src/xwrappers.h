@@ -97,6 +97,12 @@ extern void nvfbc_set_in_scan_cycle(int v);
 extern int nvfbc_frame_is_new(void);
 /* Populate tile_has_diff[] from the diff map; returns tiles marked or -1. */
 extern int nvfbc_mark_tiles_from_diffmap(void);
+/*
+ * Base of the served region inside NVFBC's capture buffer, or NULL when this
+ * cycle has no usable frame.  Valid only until the next grab - see the
+ * definition for who may hold it and for how long.
+ */
+extern const uint8_t *nvfbc_served_pixels(int *stride);
 /* Re-apply the nvfbc_* option globals by restarting the capture session. */
 extern int nvfbc_capture_reconfigure(void);
 #endif

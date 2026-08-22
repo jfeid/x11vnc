@@ -469,6 +469,48 @@ int nvfbc_frame_is_new(void) {
 }
 
 /*
+ * Base of the SERVED region inside NVFBC's own capture buffer, or NULL when
+ * this cycle has no usable frame.
+ *
+ * Phase 3' (plan §24): while H.264 owns every client nothing reads main_fb, so
+ * the two copies that would have filled it (NVFBC -> XImage -> main_fb) are
+ * skipped and the encoder reads the captured pixels where they already are.
+ *
+ * LIFETIME: valid only until the next grab, which happens at the top of the
+ * next scan_for_updates().  The only caller is h264_frame_tick(), which runs
+ * later in the same watch_loop iteration and inside the send ban, so the frame
+ * is still this cycle's.  Anything else must copy.
+ *
+ * The offset is nvfbc_src_dx/dy, the same translation nvfbc_copy_to_ximage()
+ * applies: zero whenever the capture was cropped or an output was tracked,
+ * non-zero only when a full-screen capture is serving a sub-region.
+ *
+ * -nvfbc_direct changes nothing here: direct capture is a ToSys optimisation
+ * inside the driver, the destination is still nvfbc_state.frame_buffer.
+ */
+const uint8_t *nvfbc_served_pixels(int *stride) {
+	const uint8_t *base = NULL;
+	int s;
+
+	NVFBC_LOCK;
+	if (use_nvfbc && nvfbc_capture_active && nvfbc_frame_ok &&
+	    nvfbc_frame_buffer != NULL && nvfbc_grabbed_epoch == nvfbc_epoch) {
+		s = (int) nvfbc_last_frame.width * 4;
+		if (nvfbc_src_dx >= 0 && nvfbc_src_dy >= 0 &&
+		    nvfbc_src_dx + dpy_x <= (int) nvfbc_last_frame.width &&
+		    nvfbc_src_dy + dpy_y <= (int) nvfbc_last_frame.height) {
+			base = nvfbc_frame_buffer +
+			    (size_t) nvfbc_src_dy * s + (size_t) nvfbc_src_dx * 4;
+			if (stride != NULL) {
+				*stride = s;
+			}
+		}
+	}
+	NVFBC_UNLOCK;
+	return base;
+}
+
+/*
  * Capture a frame using NVFBC into the destination XImage.
  * The XImage should be in BGRA format for best performance.
  * Returns 1 on success, 0 on failure.

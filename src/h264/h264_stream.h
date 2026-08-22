@@ -87,6 +87,17 @@ extern void h264_encoders_reset(void);
  */
 extern int h264_owns_output(void);
 
+/*
+ * Phase 3' (plan §24): while H.264 owns every client, main_fb has no reader -
+ * the encoder takes its pixels straight from NVFBC's capture buffer and
+ * libvncserver is told about no damage at all.  Filling it is then two copies
+ * per dirty tile of memory traffic nobody consumes, so scan.c asks here
+ * whether it may skip them, and reports back when it has, so the exit path
+ * knows main_fb must be refilled before Tight repaints from it.
+ */
+extern int h264_fb_copy_skippable(void);
+extern void h264_fb_copy_skipped(void);
+
 /* Called once per watch_loop cycle; drives the test source for now. */
 extern void h264_frame_tick(int tile_diffs);
 

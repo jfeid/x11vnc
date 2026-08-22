@@ -3699,6 +3699,42 @@ int scan_for_updates(int count_only) {
 
 	nap_set(tile_count);
 
+	/*
+	 * Phase 3' (plan §24): while H.264 owns every client, nothing reads
+	 * main_fb.  Damage marking is already suppressed in
+	 * mark_rect_as_modified(), so libvncserver encodes nothing from it, and
+	 * the H.264 encoder takes its pixels straight from NVFBC's capture
+	 * buffer instead.  Filling main_fb is then two copies per dirty tile
+	 * that nobody consumes - NVFBC's buffer into an XImage, then that
+	 * XImage into main_fb - which at 2560x1440 is 2 x 14.7 MB per captured
+	 * frame, or ~800 MB/s at the rate this client accepts.
+	 *
+	 * tile_has_diff[] still came from the GPU diff map, so the hybrid gate
+	 * keeps its motion signal; returning tile_count is what it is fed, the
+	 * same as on the fullscreen path just below.
+	 *
+	 * main_fb goes stale for as long as this holds.  h264_fb_copy_skipped()
+	 * is how the H.264 side learns that, so that every path out of H.264
+	 * mode refills it before asking Tight to repaint from it.
+	 *
+	 * Two conditions guard against staleness with no way out of it.
+	 * nvfbc_scanned, because otherwise scan_display() would be deriving
+	 * tile_count by comparing the screen against a main_fb that stopped
+	 * tracking it - it would report the whole screen dirty forever and the
+	 * gate could never exit.  fs_factor, because copy_screen() is how
+	 * main_fb gets refilled on the way out and it is a no-op without one.
+	 */
+	if (nvfbc_scanned && fs_factor && h264_fb_copy_skippable()) {
+		h264_fb_copy_skipped();
+		scan_in_progress = 0;
+		fb_copy_in_progress = 0;
+		if (use_threads && pointer_mode != 1) {
+			pointer_event(-1, 0, 0, NULL);
+		}
+		nap_check(tile_count);
+		return tile_count;
+	}
+
 	if (fs_factor && frac1 >= fs_frac) {
 		/* make frac1 < fs_frac if fullscreen updates are enabled */
 		frac1 = fs_frac/2.0;

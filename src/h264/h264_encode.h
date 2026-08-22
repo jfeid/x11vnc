@@ -12,6 +12,26 @@
 extern int h264_enable;                 /* -h264: encode live instead of a test file */
 extern int h264_bitrate_kbps;           /* -h264_bitrate */
 extern int h264_fps;                    /* -h264_fps */
+/*
+ * -h264_cq: NVENC constant-quality target for VBR, 0 = off (drive rate from
+ * the bitrate target alone).  Lower is better quality; useful range is roughly
+ * 19-28.  With rc=vbr this makes the bitrate a ceiling and quality the target,
+ * which is what a desktop wants: a still screen costs almost nothing and a
+ * moving one spends what it needs, up to -h264_bitrate.
+ */
+extern int h264_cq;
+/*
+ * -h264_preset / -h264_tune: NVENC preset (p1 fastest .. p7 best) and tuning
+ * info (ll, ull, hq, lossless).  Defaults are the values this encoder has
+ * always used - p4 and ll - so exposing them changes nothing until asked.
+ *
+ * Measured on real desktop text in motion before adding these: preset makes
+ * essentially no difference here (SSIM 0.95826 at p1 against 0.95830 at p7,
+ * bitrate flat), so p4 is not costing quality and there is no reason to move
+ * the default.  They exist so a sweep does not need a rebuild.
+ */
+extern char *h264_preset;
+extern char *h264_tune;
 
 /*
  * One encoder per tile.  The served region is split into horizontal bands

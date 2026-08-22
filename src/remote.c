@@ -5191,6 +5191,51 @@ char *process_remote_cmd(char *cmd, int stringonly) {
 		h264_encoders_reset();
 		goto done;
 	}
+	if (strstr(p, "h264_preset") == p) {
+		COLON_CHECK("h264_preset:")
+		if (query) {
+			snprintf(buf, bufn, "ans=%s%s%s", p, co,
+			    h264_preset ? h264_preset : "p4");
+			goto qry;
+		}
+		p += strlen("h264_preset:");
+		if (h264_preset) free(h264_preset);
+		h264_preset = strdup(p);
+		rfbLog("remote_cmd: H.264 preset %s.\n", h264_preset);
+		h264_encoders_reset();
+		goto done;
+	}
+	if (strstr(p, "h264_tune") == p) {
+		COLON_CHECK("h264_tune:")
+		if (query) {
+			snprintf(buf, bufn, "ans=%s%s%s", p, co,
+			    h264_tune ? h264_tune : "ll");
+			goto qry;
+		}
+		p += strlen("h264_tune:");
+		if (h264_tune) free(h264_tune);
+		h264_tune = strdup(p);
+		rfbLog("remote_cmd: H.264 tune %s.\n", h264_tune);
+		h264_encoders_reset();
+		goto done;
+	}
+	if (strstr(p, "h264_cq") == p) {
+		int d;
+		COLON_CHECK("h264_cq:")
+		if (query) {
+			snprintf(buf, bufn, "ans=%s%s%d", p, co, h264_cq);
+			goto qry;
+		}
+		p += strlen("h264_cq:");
+		d = atoi(p);
+		if (d < 0) d = 0;
+		if (d > 51) d = 51;
+		rfbLog("remote_cmd: H.264 quality target cq %d%s.\n", d,
+		    d == 0 ? " (off - bitrate driven)" : " (lower is better)");
+		h264_cq = d;
+		h264_encoders_reset();
+		goto done;
+	}
 	if (strstr(p, "h264_fps") == p) {
 		int d;
 		COLON_CHECK("h264_fps:")

@@ -3956,6 +3956,21 @@ int main(int argc, char* argv[]) {
 			h264_force = 1;
 			continue;
 		}
+		if (!strcmp(arg, "-h264_preset")) {
+			CHECK_ARGC
+			h264_preset = strdup(argv[++i]);
+			continue;
+		}
+		if (!strcmp(arg, "-h264_tune")) {
+			CHECK_ARGC
+			h264_tune = strdup(argv[++i]);
+			continue;
+		}
+		if (!strcmp(arg, "-h264_cq")) {
+			CHECK_ARGC
+			h264_cq = atoi(argv[++i]);
+			continue;
+		}
 		if (!strcmp(arg, "-h264_tile_pixels")) {
 			CHECK_ARGC
 			h264_tile_pixels = atoi(argv[++i]);

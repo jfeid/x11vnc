@@ -19,6 +19,9 @@ static double enc_now(void) {
 int h264_enable = 0;
 int h264_bitrate_kbps = 20000;
 int h264_fps = 30;
+int h264_cq = 0;
+char *h264_preset = NULL;       /* NULL means the built-in default below */
+char *h264_tune = NULL;
 
 #if defined(HAVE_FFMPEG)
 
@@ -119,8 +122,10 @@ h264_enc_t *h264_enc_open(int w, int h) {
 	 */
 	ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
-	av_opt_set(ctx->priv_data, "preset", "p4", 0);
-	av_opt_set(ctx->priv_data, "tune", "ll", 0);
+	av_opt_set(ctx->priv_data, "preset",
+	    h264_preset ? h264_preset : "p4", 0);
+	av_opt_set(ctx->priv_data, "tune",
+	    h264_tune ? h264_tune : "ll", 0);
 	/*
 	 * VBR, not CBR.  Strict CBR makes NVENC pad every frame with filler
 	 * NALs to hit the bitrate exactly whatever the content: measured on the
@@ -146,6 +151,17 @@ h264_enc_t *h264_enc_open(int w, int h) {
 	 * anywhere (plan §1: encoding 50 has no diagnostics).
 	 */
 	av_opt_set(ctx->priv_data, "forced-idr", "1", 0);
+	/*
+	 * Quality target.  Measured after the VBR switch: the encoder was
+	 * spending only 1.6-3.2 Mbps of a 20 Mbps ceiling and the operator
+	 * found text "a bit soft during motion".  cq spends that headroom on
+	 * quality; it costs the GPU, not the CPU, and at these rates it barely
+	 * moves the link.  Left at 0 (bitrate-driven) unless asked for, so this
+	 * changes nothing until a value has actually been judged on real content.
+	 */
+	if (h264_cq > 0) {
+		av_opt_set_int(ctx->priv_data, "cq", h264_cq, 0);
+	}
 	av_opt_set(ctx->priv_data, "zerolatency", "1", 0);
 	av_opt_set(ctx->priv_data, "delay", "0", 0);
 
@@ -177,9 +193,11 @@ h264_enc_t *h264_enc_open(int w, int h) {
 	e->w = w;
 	e->h = h;
 	e->pts = 0;
-	rfbLog("h264: encoder open, %dx%d @%dfps, %d kbps, extradata %d bytes, "
-	    "avcodec_open2 took %.0f ms\n", w, h, ctx->framerate.num,
-	    h264_bitrate_kbps, ctx->extradata_size, t_open * 1000.0);
+	rfbLog("h264: encoder open, %dx%d @%dfps, %d kbps, cq %d, preset %s, "
+	    "tune %s, extradata %d bytes, avcodec_open2 took %.0f ms\n",
+	    w, h, ctx->framerate.num, h264_bitrate_kbps, h264_cq,
+	    h264_preset ? h264_preset : "p4", h264_tune ? h264_tune : "ll",
+	    ctx->extradata_size, t_open * 1000.0);
 	return e;
 }
 

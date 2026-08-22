@@ -34,6 +34,23 @@ extern char *h264_preset;
 extern char *h264_tune;
 
 /*
+ * -h264_cuda_sched: the CUDA context the tile encoders run on.
+ *
+ * Default "blocking" - ONE context shared by every tile.  Left to itself
+ * libavcodec makes one per encoder, and each one runs a driver thread polling
+ * the NVIDIA fd at ~45,000 wakeups/s while GPU work is outstanding: ~35% of a
+ * core apiece under heavy GPU load, so two tiles cost 105% where one shared
+ * context costs 70% (plan §27).  "spin" and "yield" pick a different
+ * completion-wait flag on that shared context - measured inert on this driver,
+ * kept because another may differ.  "auto" restores libavcodec's own
+ * per-encoder contexts.
+ *
+ * Fixed at context creation, so it is a command-line option only; anything
+ * that fails falls back to "auto" with a log line.
+ */
+extern char *h264_cuda_sched;
+
+/*
  * One encoder per tile.  The served region is split into horizontal bands
  * because a single full-screen rect is undecodable on the real client - see
  * h264_stream.h and the plan, §22 - and each band carries its own independent

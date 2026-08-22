@@ -3966,6 +3966,11 @@ int main(int argc, char* argv[]) {
 			h264_tune = strdup(argv[++i]);
 			continue;
 		}
+		if (!strcmp(arg, "-h264_cuda_sched")) {
+			CHECK_ARGC
+			h264_cuda_sched = strdup(argv[++i]);
+			continue;
+		}
 		if (!strcmp(arg, "-h264_cq")) {
 			CHECK_ARGC
 			h264_cq = atoi(argv[++i]);

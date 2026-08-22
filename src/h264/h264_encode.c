@@ -22,12 +22,153 @@ int h264_fps = 30;
 int h264_cq = 0;
 char *h264_preset = NULL;       /* NULL means the built-in default below */
 char *h264_tune = NULL;
+char *h264_cuda_sched = NULL;   /* NULL means the default - see h264_cuda_device() */
 
 #if defined(HAVE_FFMPEG)
 
 #include <libavcodec/avcodec.h>
 #include <libavutil/opt.h>
 #include <libavutil/imgutils.h>
+
+/*
+ * A minimal slice of the CUDA driver API, declared here rather than pulled in
+ * from <cuda.h> so the build needs no CUDA toolkit, and resolved from
+ * libcuda.so.1 at runtime - the same approach the NVFBC code takes to
+ * libnvidia-fbc.  Defining CUDA_VERSION is what stops hwcontext_cuda.h
+ * including <cuda.h> for these same three types.
+ */
+#define CUDA_VERSION 12000
+typedef struct CUctx_st *CUcontext;
+typedef struct CUstream_st *CUstream;
+typedef int CUdevice;
+#define CU_CTX_SCHED_SPIN          0x01
+#define CU_CTX_SCHED_YIELD         0x02
+#define CU_CTX_SCHED_BLOCKING_SYNC 0x04
+
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_cuda.h>
+#include <dlfcn.h>
+
+/*
+ * ------------------------------------------------------------------
+ * The CUDA context the tile encoders run on (plan §26)
+ * ------------------------------------------------------------------
+ *
+ * Left to itself, libavcodec creates one CUDA context per encoder with default
+ * scheduling flags.  Each context runs a driver thread that sits in a poll()
+ * loop on the NVIDIA fd for as long as GPU work is outstanding - measured at
+ * 42,000 wakeups/s and ~35% of a core EACH under heavy GPU load, almost all of
+ * it system time.  With two tiles that is two thirds of the process.
+ *
+ * -h264_cuda_sched builds ONE context up front instead, shared by every tile:
+ *
+ *   blocking  (default)  CU_CTX_SCHED_BLOCKING_SYNC, shared
+ *   spin                 CU_CTX_SCHED_SPIN, shared
+ *   yield                CU_CTX_SCHED_YIELD, shared
+ *   auto                 libavcodec's own context per encoder - what this
+ *                        encoder did before, kept as the way back
+ *
+ * Measured, full-screen load, 2 tiles (plan §27):
+ *
+ *   auto      2 driver threads   105.3% total   15.7 fps delivered
+ *   spin      1 driver thread     69.5%         16.1
+ *   yield     1 driver thread     70.8%         15.7
+ *   blocking  1 driver thread     69.9%         15.6
+ *
+ * **The scheduling flag itself is inert here** - all three shared modes poll at
+ * the same ~45,000 wakeups/s, so CU_CTX_SCHED_BLOCKING_SYNC does not change
+ * what the driver's event-handler thread does.  What saves the 36 points is
+ * having one context rather than one per encoder.  The flag is still exposed
+ * because it costs nothing and a different driver may not be so indifferent.
+ *
+ * The context lives for the life of the process, like the NVFBC session: it is
+ * created on the first encoder open and reused by every one after it, across
+ * any number of gate entries and tile counts.
+ */
+static AVBufferRef *cuda_dev = NULL;
+static CUcontext cuda_own_ctx = NULL;
+static void *cuda_lib = NULL;
+
+static const char *cuda_sched_mode(void) {
+	return h264_cuda_sched ? h264_cuda_sched : "blocking";
+}
+
+static unsigned int cuda_sched_flag(const char *mode) {
+	if (!strcmp(mode, "blocking"))     return CU_CTX_SCHED_BLOCKING_SYNC;
+	if (!strcmp(mode, "spin"))         return CU_CTX_SCHED_SPIN;
+	if (!strcmp(mode, "yield"))        return CU_CTX_SCHED_YIELD;
+	return 0;
+}
+
+static AVBufferRef *h264_cuda_device(void) {
+	static int tried = 0;
+	int (*p_cuInit)(unsigned int);
+	int (*p_cuDeviceGet)(CUdevice *, int);
+	int (*p_cuCtxCreate)(CUcontext *, unsigned int, CUdevice);
+	const char *mode = cuda_sched_mode();
+	unsigned int flags;
+	CUdevice dev = 0;
+	int rc;
+
+	if (!strcmp(mode, "auto")) {
+		return NULL;
+	}
+	if (tried) {
+		return cuda_dev;        /* NULL if it failed; do not retry per tile */
+	}
+	tried = 1;
+
+	flags = cuda_sched_flag(mode);
+	if (flags == 0) {
+		rfbLog("h264: unknown -h264_cuda_sched '%s' (want blocking, spin, "
+		    "yield or auto); leaving it to libavcodec\n", mode);
+		return NULL;
+	}
+
+	cuda_lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+	if (cuda_lib == NULL) {
+		rfbLog("h264: dlopen libcuda.so.1 failed (%s); leaving the CUDA "
+		    "context to libavcodec\n", dlerror());
+		return NULL;
+	}
+	p_cuInit      = dlsym(cuda_lib, "cuInit");
+	p_cuDeviceGet = dlsym(cuda_lib, "cuDeviceGet");
+	/* _v2 is the ABI everything since CUDA 4 actually binds to */
+	p_cuCtxCreate = dlsym(cuda_lib, "cuCtxCreate_v2");
+	if (p_cuInit == NULL || p_cuDeviceGet == NULL || p_cuCtxCreate == NULL) {
+		rfbLog("h264: libcuda.so.1 is missing cuInit/cuDeviceGet/"
+		    "cuCtxCreate_v2; leaving the CUDA context to libavcodec\n");
+		return NULL;
+	}
+	if ((rc = p_cuInit(0)) != 0 || (rc = p_cuDeviceGet(&dev, 0)) != 0) {
+		rfbLog("h264: CUDA init failed (%d); leaving the context to "
+		    "libavcodec\n", rc);
+		return NULL;
+	}
+	/*
+	 * cuCtxCreate leaves the new context current on THIS thread, which is
+	 * exactly what AV_CUDA_USE_CURRENT_CONTEXT adopts.  Both calls therefore
+	 * have to happen on the same thread, and they do: the first encoder open
+	 * is from h264_frame_tick(), on watch_loop's thread.
+	 */
+	if ((rc = p_cuCtxCreate(&cuda_own_ctx, flags, dev)) != 0) {
+		rfbLog("h264: cuCtxCreate(sched=%s) failed (%d); leaving the "
+		    "context to libavcodec\n", mode, rc);
+		return NULL;
+	}
+	rc = av_hwdevice_ctx_create(&cuda_dev, AV_HWDEVICE_TYPE_CUDA, NULL, NULL,
+	    AV_CUDA_USE_CURRENT_CONTEXT);
+	if (rc < 0) {
+		rfbLog("h264: av_hwdevice_ctx_create failed (%d); leaving the "
+		    "context to libavcodec\n", rc);
+		cuda_dev = NULL;
+		return NULL;
+	}
+	rfbLog("h264: one shared CUDA context for every tile, sched=%s "
+	    "(-h264_cuda_sched auto for libavcodec's own, one per encoder)\n",
+	    mode);
+	return cuda_dev;
+}
 
 struct h264_enc {
 	AVCodecContext *ctx;
@@ -165,6 +306,19 @@ h264_enc_t *h264_enc_open(int w, int h) {
 	av_opt_set(ctx->priv_data, "zerolatency", "1", 0);
 	av_opt_set(ctx->priv_data, "delay", "0", 0);
 
+	/*
+	 * Hand libavcodec a context of our own when asked, so every tile shares
+	 * one and its completion-wait mode is ours to choose.  Doing nothing
+	 * here is the "auto" path: nvenc then makes its own, per encoder.
+	 */
+	{
+		AVBufferRef *dev = h264_cuda_device();
+
+		if (dev != NULL) {
+			ctx->hw_device_ctx = av_buffer_ref(dev);
+		}
+	}
+
 	t_open = enc_now();
 	rc = avcodec_open2(ctx, codec, NULL);
 	t_open = enc_now() - t_open;
@@ -194,9 +348,10 @@ h264_enc_t *h264_enc_open(int w, int h) {
 	e->h = h;
 	e->pts = 0;
 	rfbLog("h264: encoder open, %dx%d @%dfps, %d kbps, cq %d, preset %s, "
-	    "tune %s, extradata %d bytes, avcodec_open2 took %.0f ms\n",
+	    "tune %s, cuda %s, extradata %d bytes, avcodec_open2 took %.0f ms\n",
 	    w, h, ctx->framerate.num, h264_bitrate_kbps, h264_cq,
 	    h264_preset ? h264_preset : "p4", h264_tune ? h264_tune : "ll",
+	    ctx->hw_device_ctx ? cuda_sched_mode() : "auto",
 	    ctx->extradata_size, t_open * 1000.0);
 	return e;
 }

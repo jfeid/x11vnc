@@ -4,7 +4,7 @@
  * This module provides high-performance screen capture using NVIDIA's NVFBC API.
  * Supports consumer GeForce GPUs using Sunshine's patch-free method.
  *
- * Based on reference implementation from:
+ * Technique from:
  * - Sunshine (LizardByte) - https://github.com/LizardByte/Sunshine
  * - keylase/nvidia-patch - https://github.com/keylase/nvidia-patch
  *
